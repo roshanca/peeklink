@@ -43,7 +43,7 @@ Open `chrome://extensions`, enable Developer mode, then load `.output/chrome-mv3
 
 ## Website access
 
-Click the PeekLink toolbar icon to open settings, then click **Enable on all websites** for a one-time Chrome authorization. Reload any already-open tabs. You can still restrict pages with the allowlist and blocklist. For granular control, use the individual website grant instead. PeekLink dynamically registers its preview script only for granted origins and checks the grant again before every uncached request; removing a grant prevents future activations and metadata requests.
+Click the PeekLink toolbar icon to open settings, then click **Enable on all websites** for a one-time Chrome authorization. Reload any already-open tabs. You can still restrict pages with the allowlist and blocklist. For granular control, use the individual website grant instead. PeekLink dynamically registers its preview script only for granted origins and checks both the containing page and destination grants at the message boundary; removing a grant prevents future activations and metadata requests.
 
 Website rules apply to the page containing the link. A rule such as `example.com` also matches its subdomains. The blocklist takes precedence; a non-empty allowlist disables all unlisted pages.
 

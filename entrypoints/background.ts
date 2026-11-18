@@ -278,6 +278,28 @@ function getPreview(rawUrl: string): Promise<PreviewResponse> {
   return request;
 }
 
+async function hasWebsitePermission(rawUrl: string | undefined): Promise<boolean> {
+  if (!rawUrl) return false;
+  try {
+    const url = new URL(rawUrl);
+    if (!['http:', 'https:'].includes(url.protocol)) return false;
+    return chrome.permissions.contains({ origins: [urlOriginPattern(url)] });
+  } catch {
+    return false;
+  }
+}
+
+async function handlePreviewRequest(url: string, sourceUrl: string | undefined): Promise<PreviewResponse> {
+  if (!await hasWebsitePermission(sourceUrl)) {
+    return {
+      ok: false,
+      code: 'permission',
+      error: 'Access to the page containing this link has been removed or was not granted.',
+    };
+  }
+  return getPreview(url);
+}
+
 export default defineBackground(() => {
   schedulePreviewRegistration();
   chrome.permissions.onAdded.addListener(schedulePreviewRegistration);
@@ -288,7 +310,7 @@ export default defineBackground(() => {
     if (sender.id !== chrome.runtime.id || !sender.tab?.id) return false;
     const url = 'url' in message ? message.url : undefined;
     if (typeof url !== 'string') return false;
-    void getPreview(url).then(sendResponse);
+    void handlePreviewRequest(url, sender.tab?.url ?? sender.url).catch(failureResponse).then(sendResponse);
     return true;
   });
 

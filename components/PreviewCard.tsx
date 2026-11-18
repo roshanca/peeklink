@@ -45,7 +45,7 @@ function WebpageFrame({ url, hostname, onFailure }: { url: string; hostname: str
       className="peek-frame"
       src={url}
       title={`Interactive preview of ${hostname}`}
-      credentialless
+      credentialless=""
       sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
       referrerPolicy="no-referrer"
       onLoad={() => setLoaded(true)}

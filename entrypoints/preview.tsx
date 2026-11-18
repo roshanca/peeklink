@@ -3,7 +3,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom';
 import { PreviewCard } from '../components/PreviewCard';
-import { DEFAULT_SETTINGS, getSettings, isWebsiteAllowed, normalizeSettings, type PeekSettings } from '../lib/settings';
+import { getSettings, isWebsiteAllowed, normalizeSettings, type PeekSettings } from '../lib/settings';
 import type { PreviewResponse } from '../lib/types';
 import css from './link-preview.css?inline';
 
@@ -31,8 +31,12 @@ export default defineUnlistedScript(() => {
   let cleanupPosition: (() => void) | undefined;
   let requestId = 0;
   let hoveringPopup = false;
+  let optionHeld = false;
 
-  void getSettings().then(value => { settings = value; }).catch(() => { settings = DEFAULT_SETTINGS; });
+  void getSettings().then(value => { settings = value; }).catch(() => {
+    settings = undefined;
+    close();
+  });
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync' || !('settings' in changes)) return;
     settings = normalizeSettings(changes.settings.newValue);
@@ -77,6 +81,7 @@ export default defineUnlistedScript(() => {
   async function show(link: HTMLAnchorElement) {
     const currentSettings = settings;
     if (!link.isConnected || active !== link || !currentSettings || !isWebsiteAllowed(location.href, currentSettings)) return;
+    if (currentSettings.requireOption && !optionHeld) { close(); return; }
     const url = link.href;
     const id = ++requestId;
     popup.classList.toggle('peek-popup-webpage', currentSettings.mode === 'webpage');
@@ -110,10 +115,13 @@ export default defineUnlistedScript(() => {
 
   function arm(link: HTMLAnchorElement, optionPressed: boolean) {
     if (!link.isConnected) return;
-    if (link === active) { clearTimeout(closeTimer); return; }
     const currentSettings = settings;
     if (!currentSettings || !isWebsiteAllowed(location.href, currentSettings)) return;
-    if (currentSettings.requireOption && !optionPressed) return;
+    if (currentSettings.requireOption && !optionPressed) {
+      if (link === active) close();
+      return;
+    }
+    if (link === active) { clearTimeout(closeTimer); return; }
 
     let url: URL;
     try { url = new URL(link.href); } catch { return; }
@@ -127,6 +135,7 @@ export default defineUnlistedScript(() => {
 
   document.addEventListener('pointerover', event => {
     if (!event.isTrusted || !(event.target instanceof Element)) return;
+    optionHeld = event.altKey;
     const link = event.target.closest('a[href]') as HTMLAnchorElement | null;
     if (!link) return;
     hovered = link;
@@ -146,8 +155,22 @@ export default defineUnlistedScript(() => {
   document.addEventListener('keydown', event => {
     if (!event.isTrusted) return;
     if (event.key === 'Escape') close();
-    if (event.key === 'Alt' && settings?.requireOption && hovered) arm(hovered, true);
+    if (event.key === 'Alt') {
+      optionHeld = true;
+      if (settings?.requireOption && hovered) arm(hovered, true);
+    }
   }, true);
+
+  document.addEventListener('keyup', event => {
+    if (!event.isTrusted || event.key !== 'Alt') return;
+    optionHeld = false;
+    if (settings?.requireOption) close();
+  }, true);
+
+  window.addEventListener('blur', () => {
+    optionHeld = false;
+    if (settings?.requireOption) close();
+  });
 
   popup.addEventListener('pointerenter', () => { hoveringPopup = true; clearTimeout(closeTimer); });
   popup.addEventListener('pointerleave', () => { hoveringPopup = false; scheduleClose(); });
