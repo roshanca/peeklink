@@ -14,9 +14,12 @@ type Props = {
 
 function PreviewCover({ src }: { src: string }) {
   const [failed, setFailed] = useState(false);
-  useEffect(() => { setFailed(false); }, [src]);
+  const [loaded, setLoaded] = useState(false);
   if (failed) return null;
-  return <img className="peek-cover" src={src} alt="" loading="eager" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+  return <div className="peek-cover">
+    <img src={src} alt="" loading="eager" referrerPolicy="no-referrer"
+      data-loaded={loaded} onLoad={() => setLoaded(true)} onError={() => setFailed(true)} />
+  </div>;
 }
 
 function MetadataBody({ data }: { data?: PreviewData }) {
@@ -81,6 +84,7 @@ export function PreviewCard({ data, frame, mode, loading, error, errorCode, url,
     role={showWebpage ? 'dialog' : 'status'}
     aria-label={showWebpage ? `Interactive preview of ${hostname}` : undefined}
     aria-live={showWebpage ? 'off' : 'polite'}
+    aria-busy={loading}
   >
     <div className="peek-head">
       {data?.favicon && !faviconFailed
@@ -100,7 +104,7 @@ export function PreviewCard({ data, frame, mode, loading, error, errorCode, url,
       >{showWebpage ? 'Metadata' : 'Webpage'}</button>}
       <a className="peek-open" href={url} target="_blank" rel="noopener noreferrer" aria-label="Open link in new tab" title="Open in new tab">↗</a>
     </div>
-    {loading ? <div className="peek-skeleton"><span /><span /><span /></div> : error ?
+    {loading ? <div className="peek-skeleton" aria-hidden="true"><span /><span /><span /></div> : error ?
       <div className="peek-error">
         <div className="peek-title">Preview unavailable</div>
         <p className="peek-description">{error}</p>

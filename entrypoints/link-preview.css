@@ -53,7 +53,9 @@
 .peek-copy { flex: 1; min-width: 0; }
 .peek-title { font-size: 17px; font-weight: 670; line-height: 1.35; letter-spacing: -.35px; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .peek-description { margin: 9px 0 0; color: #73788a; font-size: 13px; line-height: 1.5; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; }
-.peek-cover { width: 94px; height: 94px; flex: none; border-radius: 12px; object-fit: cover; background: #e9eaf1; }
+.peek-cover { width: 94px; height: 94px; flex: none; border-radius: 12px; overflow: hidden; background: #e9eaf1; }
+.peek-cover img { display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 160ms ease-out; }
+.peek-cover img[data-loaded="true"] { opacity: 1; }
 .peek-frame-wrap { position: relative; width: 100%; height: clamp(220px, calc(100vh - 140px), 480px); overflow: hidden; border-radius: 12px; background: #fff; }
 .peek-frame { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
 .peek-frame-loading { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; color: #73788a; background: #f0f1f5; font-size: 13px; }
@@ -63,6 +65,7 @@
 .peek-skeleton span:nth-child(1) { width: 82%; height: 18px; }.peek-skeleton span:nth-child(2) { width: 95%; }.peek-skeleton span:nth-child(3) { width: 58%; }
 @keyframes peek-pulse { to { opacity: .45; } }
 @media (prefers-color-scheme: dark) {
+ .peek-cover { background: #41434f; }
  .peek-card { background: #292a32; border-color: rgba(255,255,255,.1); color: #f4f4f8; box-shadow: 0 22px 56px -6px rgba(0,0,0,.58), 0 5px 15px -2px rgba(0,0,0,.32); }
  .peek-domain,.peek-description { color: #aaaebb; }.peek-open { color: #c4c6d2; }.peek-open:hover,.peek-fallback { background: #393b46; }.peek-skeleton span { background: #41434f; }.peek-settings { background: #414452; color: #f0f1f6; }.peek-settings:hover { background: #505463; }.peek-mode { background: #414452; color: #e4e6ee; }.peek-mode:hover { background: #505463; }.peek-frame-loading { background: #343640; color: #b7bbc8; }.peek-frame-notice { background: #393b46; color: #c3c6d1; }
 }
@@ -70,4 +73,5 @@
   .peek-popup { --peek-duration: 90ms; --peek-ease: ease-out; }
   .peek-popup .peek-card { transform: none; transition: none; }
   .peek-skeleton span { animation: none; }
+  .peek-cover img { transition: none; }
 }
