@@ -1,3 +1,11 @@
+export type PreviewMode = 'metadata' | 'webpage';
+export type FrameRestriction = 'x-frame-options' | 'csp';
+
+export interface FramePolicy {
+  embeddable: boolean;
+  restriction?: FrameRestriction;
+}
+
 export interface PreviewData {
   url: string;
   hostname: string;
@@ -6,4 +14,19 @@ export interface PreviewData {
   image?: string;
   favicon?: string;
 }
-export type PreviewResponse = { ok: true; data: PreviewData } | { ok: false; error: string };
+
+export type PreviewErrorCode =
+  | 'invalid-url'
+  | 'permission'
+  | 'blocked-host'
+  | 'timeout'
+  | 'http'
+  | 'not-html'
+  | 'too-large'
+  | 'queue-full'
+  | 'network'
+  | 'unavailable';
+
+export type PreviewResponse =
+  | { ok: true; data: PreviewData; frame: FramePolicy }
+  | { ok: false; error: string; code: PreviewErrorCode };

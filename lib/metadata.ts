@@ -12,7 +12,10 @@ function decodeEntities(value: string): string {
 function attrs(tag: string): Record<string, string> {
   const result: Record<string, string> = {};
   const pattern = /([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
-  for (const match of tag.matchAll(pattern)) result[match[1].toLowerCase()] = decodeEntities(match[2] ?? match[3] ?? match[4] ?? '');
+  for (const match of tag.matchAll(pattern)) {
+    const name = match[1];
+    if (name) result[name.toLowerCase()] = decodeEntities(match[2] ?? match[3] ?? match[4] ?? '');
+  }
   return result;
 }
 

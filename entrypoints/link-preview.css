@@ -1,17 +1,27 @@
 :host { all: initial; color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .peek-popup { position: fixed; width: min(390px, calc(100vw - 32px)); box-sizing: border-box; pointer-events: auto; z-index: 2147483647; }
+.peek-popup-webpage { width: min(760px, calc(100vw - 32px)); }
 .peek-card { box-sizing: border-box; padding: 19px 20px 20px; border-radius: 21px; background: #f7f7fa; border: 1px solid rgba(255,255,255,.9); box-shadow: 0 20px 60px rgba(20,23,45,.19), 0 3px 12px rgba(20,23,45,.09); color: #171b2e; overflow: hidden; animation: peek-in .16s cubic-bezier(.2,.8,.2,1) both; }
+.peek-card-webpage { padding: 16px; }
 .peek-head { display: flex; align-items: center; gap: 9px; min-width: 0; margin-bottom: 16px; }
 .peek-icon { width: 23px; height: 23px; border-radius: 6px; object-fit: contain; flex: none; }
 .peek-fallback { display: grid; place-items: center; background: #e9eaf1; color: #667085; font-size: 15px; }
 .peek-domain { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 550; color: #73788a; }
 .peek-open { color: #6e768d; font-size: 20px; text-decoration: none; padding: 1px 4px; border-radius: 7px; line-height: 1; }
 .peek-open:hover { background: #e8e9f0; color: #353b54; }
+.peek-mode { flex: none; padding: 5px 8px; border: 0; border-radius: 7px; background: #e8e9f0; color: #4b5269; font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.peek-mode:hover { background: #dcdfea; }
+.peek-settings { margin-top: 12px; padding: 7px 10px; border: 0; border-radius: 8px; background: #e8e9f0; color: #353b54; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.peek-settings:hover { background: #dcdfea; }
 .peek-body { display: flex; align-items: flex-start; gap: 14px; }
 .peek-copy { flex: 1; min-width: 0; }
 .peek-title { font-size: 17px; font-weight: 670; line-height: 1.35; letter-spacing: -.35px; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .peek-description { margin: 9px 0 0; color: #73788a; font-size: 13px; line-height: 1.5; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; }
 .peek-cover { width: 94px; height: 94px; flex: none; border-radius: 12px; object-fit: cover; background: #e9eaf1; }
+.peek-frame-wrap { position: relative; width: 100%; height: clamp(220px, calc(100vh - 140px), 480px); overflow: hidden; border-radius: 12px; background: #fff; }
+.peek-frame { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
+.peek-frame-loading { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; color: #73788a; background: #f0f1f5; font-size: 13px; }
+.peek-frame-notice { margin: 0 0 12px; padding: 9px 11px; border-radius: 9px; background: #eceef4; color: #62697d; font-size: 12px; line-height: 1.45; }
 .peek-skeleton { display: grid; gap: 9px; }
 .peek-skeleton span { display: block; height: 13px; background: #e6e8ee; border-radius: 6px; animation: peek-pulse 1.1s ease-in-out infinite alternate; }
 .peek-skeleton span:nth-child(1) { width: 82%; height: 18px; }.peek-skeleton span:nth-child(2) { width: 95%; }.peek-skeleton span:nth-child(3) { width: 58%; }
@@ -19,6 +29,6 @@
 @keyframes peek-in { from { opacity: 0; transform: translateY(5px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 @media (prefers-color-scheme: dark) {
  .peek-card { background: #292a32; border-color: rgba(255,255,255,.1); color: #f4f4f8; box-shadow: 0 20px 60px rgba(0,0,0,.45), 0 3px 12px rgba(0,0,0,.25); }
- .peek-domain,.peek-description { color: #aaaebb; }.peek-open { color: #c4c6d2; }.peek-open:hover,.peek-fallback { background: #393b46; }.peek-skeleton span { background: #41434f; }
+ .peek-domain,.peek-description { color: #aaaebb; }.peek-open { color: #c4c6d2; }.peek-open:hover,.peek-fallback { background: #393b46; }.peek-skeleton span { background: #41434f; }.peek-settings { background: #414452; color: #f0f1f6; }.peek-settings:hover { background: #505463; }.peek-mode { background: #414452; color: #e4e6ee; }.peek-mode:hover { background: #505463; }.peek-frame-loading { background: #343640; color: #b7bbc8; }.peek-frame-notice { background: #393b46; color: #c3c6d1; }
 }
 @media (prefers-reduced-motion: reduce) { .peek-card,.peek-skeleton span { animation: none; } }

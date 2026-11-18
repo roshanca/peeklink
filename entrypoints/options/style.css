@@ -1,0 +1,42 @@
+:root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #202334; background: #f5f5f8; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 360px; }
+main { width: min(680px, calc(100% - 40px)); margin: 48px auto; }
+h1 { margin: 0; font-size: 28px; letter-spacing: -.7px; }
+h2 { margin: 0 0 8px; font-size: 16px; }
+h3 { margin: 24px 0 0; font-size: 13px; font-weight: 600; }
+p { color: #6d7283; line-height: 1.55; }
+.intro { margin: 8px 0 28px; }
+section { margin-top: 16px; padding: 22px; background: #fff; border: 1px solid #e6e7ed; border-radius: 16px; }
+.field { display: block; margin-top: 18px; font-size: 14px; font-weight: 600; }
+.field small { display: block; margin: 5px 0 8px; color: #7b8090; font-weight: 400; line-height: 1.45; }
+input[type="number"], input[type="text"], select, textarea { width: 100%; margin-top: 7px; padding: 10px 12px; border: 1px solid #d9dbe4; border-radius: 9px; background: #fff; color: inherit; font: inherit; }
+textarea { min-height: 76px; resize: vertical; }
+input:focus, select:focus, textarea:focus, button:focus-visible { outline: 3px solid #cbd8ff; outline-offset: 2px; }
+.checkbox { display: flex; align-items: center; gap: 9px; margin-top: 14px; font-size: 14px; }
+.checkbox input { width: 17px; height: 17px; }
+button { padding: 9px 14px; border: 0; border-radius: 9px; background: #282d42; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+button:hover { background: #414963; }
+button:disabled { cursor: default; opacity: .65; }
+button:disabled:hover { background: #282d42; }
+button.secondary { background: #eceef4; color: #444b60; }
+button.secondary:hover { background: #dfe2eb; }
+.actions { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
+.permission-form { display: flex; gap: 9px; align-items: flex-end; }
+.permission-form .field { flex: 1; margin: 0; }
+.permissions { margin: 14px 0 0; padding: 0; list-style: none; }
+.permissions li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-top: 1px solid #ececf1; font-size: 13px; overflow-wrap: anywhere; }
+.permissions button { flex: none; padding: 6px 10px; font-size: 12px; }
+.status { min-height: 20px; margin: 0; font-size: 13px; }
+.status.error { color: #b42318; }
+@media (prefers-color-scheme: dark) {
+  :root { color: #f2f3f7; background: #1d1e24; }
+  p, .field small { color: #aaaebb; }
+  section { background: #292a32; border-color: #3b3d47; }
+  input[type="number"], input[type="text"], select, textarea { background: #202127; border-color: #484b58; }
+  button { background: #dbe3ff; color: #202944; }
+  button:hover { background: #becdf7; }
+  button.secondary { background: #3b3e49; color: #e0e2eb; }
+  .permissions li { border-color: #3b3d47; }
+  .status.error { color: #ffb4ab; }
+}

@@ -4,8 +4,22 @@ export default defineConfig({
   manifest: {
     name: 'PeekLink',
     description: 'A beautiful, native-feeling link preview.',
-    permissions: ['storage'],
-    host_permissions: ['http://*/*', 'https://*/*'],
-    action: { default_title: 'PeekLink' },
+    icons: {
+      16: 'icons/16.png',
+      32: 'icons/32.png',
+      48: 'icons/48.png',
+      128: 'icons/128.png',
+    },
+    permissions: ['storage', 'scripting'],
+    optional_host_permissions: ['http://*/*', 'https://*/*'],
+    action: {
+      default_title: 'PeekLink',
+      default_icon: {
+        16: 'icons/16.png',
+        32: 'icons/32.png',
+        48: 'icons/48.png',
+        128: 'icons/128.png',
+      },
+    },
   },
 });
