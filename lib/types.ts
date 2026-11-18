@@ -20,6 +20,7 @@ export type PreviewErrorCode =
   | 'permission'
   | 'blocked-host'
   | 'timeout'
+  | 'redirect'
   | 'http'
   | 'not-html'
   | 'too-large'

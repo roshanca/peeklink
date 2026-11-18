@@ -1,5 +1,6 @@
 import { defineUnlistedScript } from '#imports';
 import React from 'react';
+import { flushSync } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom';
 import { PreviewCard } from '../components/PreviewCard';
@@ -18,7 +19,8 @@ export default defineUnlistedScript(() => {
   shadow.append(style);
   const popup = document.createElement('div');
   popup.className = 'peek-popup';
-  popup.style.display = 'none';
+  popup.hidden = true;
+  popup.inert = true;
   shadow.append(popup);
   document.documentElement.append(host);
   const root = createRoot(popup);
@@ -29,6 +31,8 @@ export default defineUnlistedScript(() => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
   let cleanupPosition: (() => void) | undefined;
+  let updatePosition: (() => Promise<void>) | undefined;
+  let closing: { fade: Animation; resumableLink: HTMLAnchorElement | null } | undefined;
   let requestId = 0;
   let hoveringPopup = false;
   let optionHeld = false;
@@ -48,20 +52,58 @@ export default defineUnlistedScript(() => {
     clearTimeout(closeTimer);
   }
 
-  function close() {
-    clearTimers();
+  function resetPopup() {
     requestId++;
     cleanupPosition?.();
     cleanupPosition = undefined;
-    popup.style.display = 'none';
+    updatePosition = undefined;
+    closing = undefined;
+    popup.classList.remove('peek-popup-open');
+    popup.inert = true;
+    popup.hidden = true;
     root.render(null);
-    active = null;
     hoveringPopup = false;
+  }
+
+  function revealPopup() {
+    closing = undefined;
+    popup.classList.add('peek-popup-open');
+    popup.inert = false;
+  }
+
+  function close(resumable = false) {
+    clearTimers();
+    if (!resumable) {
+      requestId++;
+      active = null;
+    }
+    hoveringPopup = false;
+    if (closing) {
+      if (!resumable) closing.resumableLink = null;
+      return;
+    }
+
+    popup.inert = true;
+    popup.classList.remove('peek-popup-open');
+    const fade = popup.getAnimations().find(animation =>
+      animation instanceof CSSTransition && animation.transitionProperty === 'opacity');
+    if (!fade) {
+      active = null;
+      resetPopup();
+      return;
+    }
+    closing = { fade, resumableLink: active };
+    const finish = () => {
+      if (closing?.fade !== fade) return;
+      if (active === closing.resumableLink) active = null;
+      resetPopup();
+    };
+    void fade.finished.then(finish, finish);
   }
 
   function scheduleClose() {
     clearTimeout(closeTimer);
-    closeTimer = setTimeout(() => { if (!hoveringPopup) close(); }, 180);
+    closeTimer = setTimeout(() => { if (!hoveringPopup) close(true); }, 180);
   }
 
   function render(url: string, state: { loading: boolean; response?: PreviewResponse }) {
@@ -82,21 +124,33 @@ export default defineUnlistedScript(() => {
     const currentSettings = settings;
     if (!link.isConnected || active !== link || !currentSettings || !isWebsiteAllowed(location.href, currentSettings)) return;
     if (currentSettings.requireOption && !optionHeld) { close(); return; }
+    if (closing) resetPopup();
     const url = link.href;
     const id = ++requestId;
     popup.classList.toggle('peek-popup-webpage', currentSettings.mode === 'webpage');
-    popup.style.display = 'block';
-    render(url, { loading: true });
+    popup.hidden = false;
+    flushSync(() => render(url, { loading: true }));
     cleanupPosition?.();
+    let positioned = false;
+    let positionId = 0;
     const update = async () => {
+      if (id !== requestId || closing) return;
       if (!link.isConnected) { close(); return; }
+      const updateId = ++positionId;
       const pos = await computePosition(link, popup, {
         strategy: 'fixed',
         placement: 'bottom-start',
         middleware: [offset(12), flip({ padding: 16 }), shift({ padding: 16 })],
       });
+      if (id !== requestId || updateId !== positionId || closing) return;
       Object.assign(popup.style, { left: `${pos.x}px`, top: `${pos.y}px` });
+      popup.dataset.side = pos.placement.split('-')[0];
+      if (!positioned) {
+        positioned = true;
+        revealPopup();
+      }
     };
+    updatePosition = update;
     cleanupPosition = autoUpdate(link, popup, () => { void update(); });
     try {
       const response = await chrome.runtime.sendMessage({ type: 'PEEKLINK_PREVIEW', url }) as PreviewResponse;
@@ -121,7 +175,14 @@ export default defineUnlistedScript(() => {
       if (link === active) close();
       return;
     }
-    if (link === active) { clearTimeout(closeTimer); return; }
+    if (link === active) {
+      clearTimeout(closeTimer);
+      if (closing?.resumableLink === link) {
+        revealPopup();
+        void updatePosition?.();
+      }
+      return;
+    }
 
     let url: URL;
     try { url = new URL(link.href); } catch { return; }
@@ -149,7 +210,10 @@ export default defineUnlistedScript(() => {
       hovered = null;
     }
     if (!active) return;
-    if (from instanceof Node && active.contains(from) && !(to instanceof Node && active.contains(to))) scheduleClose();
+    if (from instanceof Node && active.contains(from) && !(to instanceof Node && active.contains(to))) {
+      if (popup.classList.contains('peek-popup-open')) scheduleClose();
+      else close();
+    }
   }, true);
 
   document.addEventListener('keydown', event => {
@@ -173,6 +237,9 @@ export default defineUnlistedScript(() => {
   });
 
   popup.addEventListener('pointerenter', () => { hoveringPopup = true; clearTimeout(closeTimer); });
-  popup.addEventListener('pointerleave', () => { hoveringPopup = false; scheduleClose(); });
+  popup.addEventListener('pointerleave', () => {
+    hoveringPopup = false;
+    if (popup.classList.contains('peek-popup-open')) scheduleClose();
+  });
   document.addEventListener('scroll', () => { if (active && !active.isConnected) close(); }, true);
 });

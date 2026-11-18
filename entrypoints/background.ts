@@ -12,6 +12,8 @@ const MAX_CONCURRENT_REQUESTS = 4;
 const MAX_QUEUED_REQUESTS = 32;
 const REQUEST_TIMEOUT = 8_000;
 
+const transientFailures = new Set<PreviewErrorCode>(['network', 'timeout', 'queue-full']);
+
 class PreviewFailure extends Error {
   constructor(readonly code: PreviewErrorCode, message: string) {
     super(message);
@@ -173,21 +175,36 @@ async function fetchHtml(url: URL): Promise<{ html: string; finalUrl: string; fr
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
     try {
-      const response = await fetch(url.href, {
+      const request = (target: URL) => fetch(target.href, {
         signal: controller.signal,
         credentials: 'omit',
         referrerPolicy: 'no-referrer',
-        redirect: 'error',
+        redirect: 'manual',
         cache: 'no-store',
         headers: { Accept: 'text/html,application/xhtml+xml' },
       });
-      if (!response.ok) throw new PreviewFailure('http', `The website returned HTTP ${response.status}.`);
+      let target = url;
+      let response = await request(target);
+      if (response.type === 'opaqueredirect' && url.pathname !== '/') {
+        // Fetch hides the Location header. Probe only the same path's slash variant.
+        target = new URL(url.href);
+        target.pathname = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : `${url.pathname}/`;
+        response = await request(target);
+      }
+      if (response.type === 'opaqueredirect' || (target !== url && !response.ok)) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new PreviewFailure('redirect', 'This link redirects to another address. Open it in a new tab.');
+      }
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new PreviewFailure('http', `The website returned HTTP ${response.status}.`);
+      }
       const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
       if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
         await response.body?.cancel().catch(() => undefined);
         throw new PreviewFailure('not-html', 'This link does not point to an HTML page.');
       }
-      const finalUrl = assertPublicUrl(response.url || url.href);
+      const finalUrl = assertPublicUrl(response.url || target.href);
       const bytes = await readBoundedBytes(response, MAX_HTML_BYTES);
       return { html: new TextDecoder().decode(bytes), finalUrl: finalUrl.href, frame: getFramePolicy(response.headers) };
     } catch (error) {
@@ -256,8 +273,7 @@ async function loadPreview(url: URL): Promise<PreviewResponse> {
     return response;
   } catch (error) {
     const response = failureResponse(error);
-    // Transient failures get a short negative cache; configuration errors do not.
-    writeCache(url.href, response);
+    if (!response.ok && !transientFailures.has(response.code)) writeCache(url.href, response);
     return response;
   }
 }
