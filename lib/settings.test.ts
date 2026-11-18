@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { matchesTargetRule, parseTargetRules } from './preview-target';
 import {
   DEFAULT_SETTINGS,
   isWebsiteAllowed,
@@ -28,5 +29,17 @@ describe('settings', () => {
       ...settings,
       blocklist: ['docs.example.com'],
     })).toBe(false);
+  });
+
+  it('matches excluded destinations at hostname and path boundaries', () => {
+    const rules = parseTargetRules('https://EXAMPLE.com/subscribe?source=nav\nexample.com/media/*');
+    expect(normalizeSettings({ excludedTargets: rules }).excludedTargets).toEqual(['example.com/subscribe', 'example.com/media/*']);
+    const excluded = (url: string) => rules.some(rule => matchesTargetRule(new URL(url), rule));
+    expect(excluded('http://sub.example.com/subscribe?plan=annual')).toBe(true);
+    expect(excluded('https://example.com/subscribe/help')).toBe(false);
+    expect(excluded('https://example.com/media/123')).toBe(true);
+    expect(excluded('https://notexample.com/media/123')).toBe(false);
+    expect(excluded('https://example.com/mediakit/123')).toBe(false);
+    expect(() => parseTargetRules('example.com/me*dia')).toThrow('Invalid destination rule');
   });
 });

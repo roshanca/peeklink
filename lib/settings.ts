@@ -1,4 +1,5 @@
 import type { PreviewMode } from './types';
+import { normalizeTargetRule } from './preview-target';
 
 export interface PeekSettings {
   mode: PreviewMode;
@@ -6,6 +7,7 @@ export interface PeekSettings {
   delay: number;
   allowlist: string[];
   blocklist: string[];
+  excludedTargets: string[];
 }
 
 export const DEFAULT_SETTINGS: PeekSettings = {
@@ -14,6 +16,7 @@ export const DEFAULT_SETTINGS: PeekSettings = {
   delay: 500,
   allowlist: [],
   blocklist: [],
+  excludedTargets: [],
 };
 
 const SETTINGS_KEY = 'settings';
@@ -60,9 +63,9 @@ export function isWebsiteAllowed(pageUrl: string, settings: PeekSettings): boole
 export function normalizeSettings(value: unknown): PeekSettings {
   if (!value || typeof value !== 'object') return { ...DEFAULT_SETTINGS };
   const candidate = value as Partial<PeekSettings>;
-  const cleanRules = (rules: unknown): string[] => Array.isArray(rules)
+  const cleanRules = (rules: unknown, normalize = normalizeWebsiteRule): string[] => Array.isArray(rules)
     ? [...new Set(rules.filter((rule): rule is string => typeof rule === 'string')
-      .map(normalizeWebsiteRule)
+      .map(normalize)
       .filter((rule): rule is string => Boolean(rule)))]
     : [];
 
@@ -78,6 +81,7 @@ export function normalizeSettings(value: unknown): PeekSettings {
       : DEFAULT_SETTINGS.delay,
     allowlist: cleanRules(candidate.allowlist),
     blocklist: cleanRules(candidate.blocklist),
+    excludedTargets: cleanRules(candidate.excludedTargets, normalizeTargetRule),
   };
 }
 

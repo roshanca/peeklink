@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { websiteOriginPattern } from '../../lib/permissions';
+import { parseTargetRules } from '../../lib/preview-target';
 import {
   DEFAULT_SETTINGS,
   getSettings,
@@ -15,6 +16,7 @@ export function Options() {
   const [settings, setSettings] = useState<PeekSettings>(DEFAULT_SETTINGS);
   const [allowlist, setAllowlist] = useState('');
   const [blocklist, setBlocklist] = useState('');
+  const [excludedTargets, setExcludedTargets] = useState('');
   const [site, setSite] = useState('');
   const [origins, setOrigins] = useState<string[]>([]);
   const [status, setStatus] = useState('');
@@ -30,6 +32,7 @@ export function Options() {
       setSettings(saved);
       setAllowlist(saved.allowlist.join('\n'));
       setBlocklist(saved.blocklist.join('\n'));
+      setExcludedTargets(saved.excludedTargets.join('\n'));
     }).catch(() => setError('Could not load settings.'));
     void refreshPermissions().catch(() => setError('Could not load website permissions.'));
   }, []);
@@ -43,11 +46,17 @@ export function Options() {
     setStatus('');
     setError('');
     try {
-      const next = normalizeSettings({ ...settings, allowlist: parseWebsiteRules(allowlist), blocklist: parseWebsiteRules(blocklist) });
+      const next = normalizeSettings({
+        ...settings,
+        allowlist: parseWebsiteRules(allowlist),
+        blocklist: parseWebsiteRules(blocklist),
+        excludedTargets: parseTargetRules(excludedTargets),
+      });
       await saveSettings(next);
       setSettings(next);
       setAllowlist(next.allowlist.join('\n'));
       setBlocklist(next.blocklist.join('\n'));
+      setExcludedTargets(next.excludedTargets.join('\n'));
       setStatus('Settings saved.');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not save settings.');
@@ -154,6 +163,10 @@ export function Options() {
         <label className="field">Blocklist
           <small>One hostname per line, for example social.example.com</small>
           <textarea value={blocklist} onChange={event => setBlocklist(event.target.value)} placeholder="No blocked websites" />
+        </label>
+        <label className="field">Excluded link destinations
+          <small>One rule per line. Use example.com for a domain and its subdomains, example.com/subscribe for an exact path, or example.com/media/* for paths under a directory. Query strings and fragments are ignored.</small>
+          <textarea value={excludedTargets} onChange={event => setExcludedTargets(event.target.value)} placeholder="example.com/media/*" />
         </label>
         <div className="actions">
           <button type="submit">Save settings</button>

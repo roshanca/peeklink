@@ -4,6 +4,7 @@ import { flushSync } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom';
 import { PreviewCard } from '../components/PreviewCard';
+import { canPreviewTarget, previewMediaSelector } from '../lib/preview-target';
 import { getSettings, isWebsiteAllowed, normalizeSettings, type PeekSettings } from '../lib/settings';
 import type { PreviewResponse } from '../lib/types';
 import css from './link-preview.css?inline';
@@ -124,13 +125,11 @@ export default defineUnlistedScript(() => {
     const currentSettings = settings;
     if (!link.isConnected || active !== link || !currentSettings || !isWebsiteAllowed(location.href, currentSettings)) return;
     if (currentSettings.requireOption && !optionHeld) { close(); return; }
+    if (!canPreviewTarget(link, currentSettings.excludedTargets)) { close(); return; }
     if (closing) resetPopup();
     const url = link.href;
     const id = ++requestId;
-    popup.classList.toggle('peek-popup-webpage', currentSettings.mode === 'webpage');
-    popup.hidden = false;
-    flushSync(() => render(url, { loading: true }));
-    cleanupPosition?.();
+    const isCurrent = () => id === requestId && active === link && link.isConnected && link.href === url;
     let positioned = false;
     let positionId = 0;
     const update = async () => {
@@ -150,21 +149,24 @@ export default defineUnlistedScript(() => {
         revealPopup();
       }
     };
+    popup.classList.toggle('peek-popup-webpage', currentSettings.mode === 'webpage');
+    popup.hidden = false;
+    flushSync(() => render(url, { loading: true }));
     updatePosition = update;
     cleanupPosition = autoUpdate(link, popup, () => { void update(); });
+
+    let response: PreviewResponse;
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'PEEKLINK_PREVIEW', url }) as PreviewResponse;
-      if (id !== requestId || active !== link) return;
-      render(url, { loading: false, response });
-      void update();
+      response = await chrome.runtime.sendMessage({ type: 'PEEKLINK_PREVIEW', url }) as PreviewResponse;
     } catch {
-      if (id === requestId && active === link) {
-        render(url, {
-          loading: false,
-          response: { ok: false, code: 'unavailable', error: 'Could not communicate with PeekLink. Reload the page or extension.' },
-        });
-      }
+      response = { ok: false, code: 'unavailable', error: 'Could not communicate with PeekLink. Reload the page or extension.' };
     }
+    if (!isCurrent()) return;
+    if (!response.ok && response.code === 'not-html') {
+      close();
+      return;
+    }
+    render(url, { loading: false, response });
   }
 
   function arm(link: HTMLAnchorElement, optionPressed: boolean) {
@@ -184,9 +186,7 @@ export default defineUnlistedScript(() => {
       return;
     }
 
-    let url: URL;
-    try { url = new URL(link.href); } catch { return; }
-    if (!['http:', 'https:'].includes(url.protocol)) return;
+    if (!canPreviewTarget(link, currentSettings.excludedTargets)) return;
 
     clearTimers();
     if (active) close();
@@ -197,8 +197,14 @@ export default defineUnlistedScript(() => {
   document.addEventListener('pointerover', event => {
     if (!event.isTrusted || !(event.target instanceof Element)) return;
     optionHeld = event.altKey;
-    const link = event.target.closest('a[href]') as HTMLAnchorElement | null;
-    if (!link) return;
+    const link = event.target.closest('a[href]');
+    if (!(link instanceof HTMLAnchorElement)) return;
+    const media = event.target.closest(previewMediaSelector);
+    if (media && link.contains(media)) {
+      hovered = null;
+      if (active === link) close();
+      return;
+    }
     hovered = link;
     arm(link, event.altKey);
   }, true);
