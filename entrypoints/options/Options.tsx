@@ -35,6 +35,18 @@ export function Options() {
       setExcludedTargets(saved.excludedTargets.join('\n'));
     }).catch(() => setError('Could not load settings.'));
     void refreshPermissions().catch(() => setError('Could not load website permissions.'));
+    const sync = () => { void refreshPermissions().catch(() => undefined); };
+    // @types/chrome omits removeListener on these event interfaces.
+    const events = chrome.permissions as unknown as {
+      onAdded: chrome.events.Event<() => void>;
+      onRemoved: chrome.events.Event<() => void>;
+    };
+    events.onAdded.addListener(sync);
+    events.onRemoved.addListener(sync);
+    return () => {
+      events.onAdded.removeListener(sync);
+      events.onRemoved.removeListener(sync);
+    };
   }, []);
 
   function update<Key extends keyof PeekSettings>(key: Key, value: PeekSettings[Key]) {
@@ -101,7 +113,12 @@ export function Options() {
   function revokeAccess(origin: string) {
     setStatus('');
     setError('');
-    void chrome.permissions.remove({ origins: [origin] }).then(async () => {
+    void chrome.permissions.remove({ origins: [origin] }).then(async removed => {
+      if (!removed) {
+        setError(`Access could not be removed for ${origin}`);
+        await refreshPermissions();
+        return;
+      }
       setStatus(`Access removed for ${origin}`);
       await refreshPermissions();
     }).catch(() => setError('Could not remove website access.'));

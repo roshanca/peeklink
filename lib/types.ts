@@ -26,6 +26,7 @@ export type PreviewErrorCode =
   | 'too-large'
   | 'queue-full'
   | 'network'
+  | 'cancelled'
   | 'unavailable';
 
 export type PreviewResponse =

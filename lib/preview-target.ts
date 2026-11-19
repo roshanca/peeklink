@@ -46,6 +46,10 @@ export function matchesTargetRule(url: URL, rule: string): boolean {
 
 export function canPreviewTarget(link: HTMLAnchorElement, excludedTargets: string[]): boolean {
   if (link.closest(controlSelector)) return false;
+  // Empty or fragment-only hrefs resolve to the current page — they are script
+  // hooks, not destinations, and previewing them would fetch the page itself.
+  const rawHref = link.getAttribute('href')?.trim() ?? '';
+  if (!rawHref || rawHref.startsWith('#')) return false;
   let url: URL;
   try { url = new URL(link.href); } catch { return false; }
   if (!['http:', 'https:'].includes(url.protocol) || imagePath.test(url.pathname)) return false;

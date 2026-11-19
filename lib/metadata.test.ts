@@ -24,9 +24,41 @@ describe('parseMetadata', () => {
 
   it('falls back to the title tag and default favicon', () => {
     const data = parseMetadata('<title>Example &mdash; page</title>', 'https://www.example.com/docs');
-    expect(data.title).toBe('Example &mdash; page');
+    expect(data.title).toBe('Example — page');
     expect(data.hostname).toBe('example.com');
     expect(data.favicon).toBe('https://www.example.com/favicon.ico');
+  });
+
+  it('decodes common named and numeric entities', () => {
+    const data = parseMetadata(
+      '<title>Tom &amp; Jerry &#8212; &#x41;dventure &hellip;</title>',
+      'https://example.com',
+    );
+    expect(data.title).toBe('Tom & Jerry — Adventure …');
+  });
+
+  it('replaces invalid code points instead of failing the preview', () => {
+    const data = parseMetadata(
+      '<title>a &#x110000; &#X41; &#99999999; &#0; &#xD800; b</title>',
+      'https://example.com',
+    );
+    expect(data.title).toBe('a � A � � � b');
+  });
+
+  it('decodes meta attributes once without unwrapping literal entities', () => {
+    const data = parseMetadata(
+      '<meta property="og:title" content="Literal &amp;copy; &amp;">',
+      'https://example.com',
+    );
+    expect(data.title).toBe('Literal &copy; &');
+  });
+
+  it('decodes semicolon-less numeric references in attribute values', () => {
+    const data = parseMetadata(
+      '<meta property="og:image" content="/a?x=1&#38y=2">',
+      'https://example.com',
+    );
+    expect(data.image).toBe('https://example.com/a?x=1&y=2');
   });
 
   it('rejects non-HTTP metadata images', () => {

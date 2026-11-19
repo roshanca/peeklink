@@ -11,7 +11,7 @@ Chrome MV3 link-preview extension, macOS + Arc hybrid style.
 - Per-site allowlist and blocklist rules, including subdomain matching.
 - One-time all-website authorization or individual website grants and revocation.
 - Dynamic content-script registration limited to granted origins.
-- In-flight request deduplication, four-request concurrency limit, and a bounded queue.
+- In-flight request deduplication, four-request concurrency limit, and a bounded queue with a wait deadline. Closing a preview cancels its in-flight request.
 - In-memory LRU cache: 15 minutes for successful previews and 30 seconds for cacheable failures. Network errors, timeouts, and queue saturation can be retried on the next hover.
 - Timeouts, HTML type validation, a 400KB streaming response cap, and readable errors.
 - Optional interactive webpage previews in a sandboxed, credentialless iframe.
@@ -43,7 +43,7 @@ Open `chrome://extensions`, enable Developer mode, then load `.output/chrome-mv3
 
 ## Website access
 
-Click the PeekLink toolbar icon to open settings, then click **Enable on all websites** for a one-time Chrome authorization. Reload any already-open tabs. You can still restrict pages with the allowlist and blocklist. For granular control, use the individual website grant instead. PeekLink dynamically registers its preview script only for granted origins and checks both the containing page and destination grants at the message boundary; removing a grant prevents future activations and metadata requests.
+Click the PeekLink toolbar icon to open settings, then click **Enable on all websites** for a one-time Chrome authorization. Reload any already-open tabs. You can still restrict pages with the allowlist and blocklist. For granular control, use the individual website grant instead. PeekLink dynamically registers its preview script only for granted origins and checks both the containing page and destination grants at the message boundary; removing a grant prevents future activations, aborts matching in-flight requests, and evicts their cached previews.
 
 Website rules apply to the page containing the link. A rule such as `example.com` also matches its subdomains. The blocklist takes precedence; a non-empty allowlist disables all unlisted pages.
 

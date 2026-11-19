@@ -29,12 +29,14 @@ export default defineUnlistedScript(() => {
   let settings: PeekSettings | undefined;
   let active: HTMLAnchorElement | null = null;
   let hovered: HTMLAnchorElement | null = null;
+  let armedLink: HTMLAnchorElement | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
   let cleanupPosition: (() => void) | undefined;
   let updatePosition: (() => Promise<void>) | undefined;
   let closing: { fade: Animation; resumableLink: HTMLAnchorElement | null } | undefined;
   let requestId = 0;
+  let inflightId: number | null = null;
   let hoveringPopup = false;
   let optionHeld = false;
 
@@ -45,6 +47,7 @@ export default defineUnlistedScript(() => {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync' || !('settings' in changes)) return;
     settings = normalizeSettings(changes.settings.newValue);
+    armedLink = null;
     close();
   });
 
@@ -53,8 +56,21 @@ export default defineUnlistedScript(() => {
     clearTimeout(closeTimer);
   }
 
-  function resetPopup() {
+  function invalidateRequest() {
+    const id = inflightId;
+    inflightId = null;
     requestId++;
+    if (id !== null) {
+      try {
+        void chrome.runtime.sendMessage({ type: 'PEEKLINK_CANCEL', requestId: id }).catch(() => undefined);
+      } catch {
+        // The extension context may already be gone.
+      }
+    }
+  }
+
+  function resetPopup() {
+    invalidateRequest();
     cleanupPosition?.();
     cleanupPosition = undefined;
     updatePosition = undefined;
@@ -75,7 +91,7 @@ export default defineUnlistedScript(() => {
   function close(resumable = false) {
     clearTimers();
     if (!resumable) {
-      requestId++;
+      invalidateRequest();
       active = null;
     }
     hoveringPopup = false;
@@ -117,7 +133,13 @@ export default defineUnlistedScript(() => {
       frame={response?.ok ? response.frame : undefined}
       error={response && !response.ok ? response.error : undefined}
       errorCode={response && !response.ok ? response.code : undefined}
-      onOpenSettings={() => { void chrome.runtime.openOptionsPage(); }}
+      onOpenSettings={() => {
+        try {
+          void chrome.runtime.sendMessage({ type: 'PEEKLINK_OPEN_SETTINGS' }).catch(() => undefined);
+        } catch {
+          // The extension context may already be gone.
+        }
+      }}
     />);
   }
 
@@ -128,7 +150,8 @@ export default defineUnlistedScript(() => {
     if (!canPreviewTarget(link, currentSettings.excludedTargets)) { close(); return; }
     if (closing) resetPopup();
     const url = link.href;
-    const id = ++requestId;
+    invalidateRequest();
+    const id = requestId;
     const isCurrent = () => id === requestId && active === link && link.isConnected && link.href === url;
     let positioned = false;
     let positionId = 0;
@@ -140,8 +163,9 @@ export default defineUnlistedScript(() => {
         strategy: 'fixed',
         placement: 'bottom-start',
         middleware: [offset(12), flip({ padding: 16 }), shift({ padding: 16 })],
-      });
+      }).catch(() => null);
       if (id !== requestId || updateId !== positionId || closing) return;
+      if (!pos) { close(); return; }
       Object.assign(popup.style, { left: `${pos.x}px`, top: `${pos.y}px` });
       popup.dataset.side = pos.placement.split('-')[0];
       if (!positioned) {
@@ -155,11 +179,14 @@ export default defineUnlistedScript(() => {
     updatePosition = update;
     cleanupPosition = autoUpdate(link, popup, () => { void update(); });
 
+    inflightId = id;
     let response: PreviewResponse;
     try {
-      response = await chrome.runtime.sendMessage({ type: 'PEEKLINK_PREVIEW', url }) as PreviewResponse;
+      response = await chrome.runtime.sendMessage({ type: 'PEEKLINK_PREVIEW', url, requestId: id }) as PreviewResponse;
     } catch {
       response = { ok: false, code: 'unavailable', error: 'Could not communicate with PeekLink. Reload the page or extension.' };
+    } finally {
+      if (inflightId === id) inflightId = null;
     }
     if (!isCurrent()) return;
     if (!response.ok && response.code === 'not-html') {
@@ -202,10 +229,14 @@ export default defineUnlistedScript(() => {
     const media = event.target.closest(previewMediaSelector);
     if (media && link.contains(media)) {
       hovered = null;
+      armedLink = null;
       if (active === link) close();
       return;
     }
     hovered = link;
+    if (!settings) return;
+    if (link === armedLink && link !== active) return;
+    armedLink = link;
     arm(link, event.altKey);
   }, true);
 
@@ -214,6 +245,7 @@ export default defineUnlistedScript(() => {
     const to = event.relatedTarget;
     if (hovered && from instanceof Node && hovered.contains(from) && !(to instanceof Node && hovered.contains(to))) {
       hovered = null;
+      armedLink = null;
     }
     if (!active) return;
     if (from instanceof Node && active.contains(from) && !(to instanceof Node && active.contains(to))) {
