@@ -75,6 +75,43 @@ function onRemoved(): ((permissions: { origins?: string[]; permissions?: string[
   return vi.mocked(chrome.permissions.onRemoved.addListener).mock.calls.at(-1)?.[0];
 }
 
+function onAdded(): ((permissions: { origins?: string[]; permissions?: string[] }) => void) | undefined {
+  return vi.mocked(chrome.permissions.onAdded.addListener).mock.calls.at(-1)?.[0];
+}
+
+function sessionSet(): ReturnType<typeof vi.fn> {
+  return chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
+}
+
+function sessionGet(): ReturnType<typeof vi.fn> {
+  return chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
+}
+
+// vi.mocked infers a chrome API's last overload — the callback form — so the
+// Promise signatures these tests mock are spelled out explicitly.
+function permissionsGetAll() {
+  return vi.mocked(chrome.permissions.getAll as () => Promise<chrome.permissions.Permissions>);
+}
+
+function registeredScripts() {
+  return vi.mocked(chrome.scripting.getRegisteredContentScripts as (
+    filter?: chrome.scripting.ContentScriptFilter,
+  ) => Promise<chrome.scripting.RegisteredContentScript[]>);
+}
+
+// Assertions about persisted cache entries must ignore any other keys'
+// writes to the shared session area.
+function previewCacheWrites(): unknown[] {
+  return sessionSet().mock.calls
+    .map(([value]) => value)
+    .filter(value => Boolean(value) && typeof value === 'object' && 'previewCache' in value);
+}
+
+function containsCallsFor(pattern: string): number {
+  return vi.mocked(chrome.permissions.contains).mock.calls
+    .filter(([permissions]) => permissions.origins?.includes(pattern)).length;
+}
+
 function tabRemoved(tabId: number): void {
   vi.mocked(chrome.tabs.onRemoved.addListener).mock.calls[0]?.[0]?.(tabId, { windowId: 1, isWindowClosing: false });
 }
@@ -93,7 +130,12 @@ beforeEach(async () => {
       onAdded: { addListener: vi.fn() },
       onRemoved: { addListener: vi.fn() },
     },
-    scripting: { getRegisteredContentScripts: vi.fn().mockResolvedValue([]) },
+    scripting: {
+      getRegisteredContentScripts: vi.fn().mockResolvedValue([]),
+      registerContentScripts: vi.fn().mockResolvedValue(undefined),
+      updateContentScripts: vi.fn().mockResolvedValue(undefined),
+      unregisterContentScripts: vi.fn().mockResolvedValue(undefined),
+    },
     runtime: {
       id: 'peeklink',
       onMessage: { addListener },
@@ -338,7 +380,7 @@ describe('preview requests', () => {
     expect(finalSignal?.aborted).toBe(true);
   });
 
-  it('denies delivery when the final redirect host is revoked during delivery rechecks', async () => {
+  it('does not let a stale in-flight grant resolve back into the cache after a revocation', async () => {
     const input = `${origin}/`;
     const final = 'https://www.destination.example.com/';
     fetchMock.mockImplementation(async inputUrl => {
@@ -349,22 +391,24 @@ describe('preview requests', () => {
       }
       return htmlResponse();
     });
-    const sourceResolvers: Array<(granted: boolean) => void> = [];
-    let sourceCalls = 0;
-    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
-      if (origins.includes('https://source.example.com/*')) {
-        sourceCalls += 1;
-        if (sourceCalls === 2) return new Promise<boolean>(resolve => { sourceResolvers.push(resolve); });
-      }
-      return Promise.resolve(true);
-    });
+    const finalResolvers: Array<(granted: boolean) => void> = [];
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) =>
+      origins.includes('https://www.destination.example.com/*')
+        ? new Promise<boolean>(resolve => { finalResolvers.push(resolve); })
+        : Promise.resolve(true));
 
     const result = preview(input, 90);
-    await vi.waitFor(() => expect(sourceResolvers).toHaveLength(1));
+    await vi.waitFor(() => expect(finalResolvers).toHaveLength(1));
     onRemoved()?.({ origins: ['https://www.destination.example.com/*'], permissions: [] });
-    sourceResolvers[0]?.(true);
-
+    // The query resolves granted only after the revocation invalidated it —
+    // the stale answer must not be served to this waiter or cached for others.
+    finalResolvers[0]?.(true);
     expect(await result).toMatchObject({ ok: false, code: 'permission' });
+
+    const second = preview(input, 91);
+    await vi.waitFor(() => expect(finalResolvers).toHaveLength(2));
+    finalResolvers[1]?.(true);
+    expect(await second).toMatchObject({ ok: true, data: { url: final } });
   });
 
   it('keeps a replacement flight tracked when a superseded flight finishes late', async () => {
@@ -402,9 +446,10 @@ describe('preview requests', () => {
     expect(await first).toMatchObject({ ok: false, code: 'cancelled' });
 
     const second = preview(input, 92);
-    await vi.waitFor(() => expect(releaseFinal).toBeDefined());
-    // Let the superseded flight run its late cleanup before the revocation.
+    // The replacement joins the first flight's in-flight grant query; release
+    // it so both proceed, and let the superseded flight clean up late.
     releaseFirstPermission(true);
+    await vi.waitFor(() => expect(releaseFinal).toBeDefined());
     await tick();
     await tick();
     onRemoved()?.({ origins: ['https://www.destination.example.com/*'], permissions: [] });
@@ -512,8 +557,14 @@ describe('preview requests', () => {
   });
 
   it('applies a mid-flight revocation to shared waiters and skips the cache write', async () => {
-    const resolvers: Array<(response: Response) => void> = [];
-    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { resolvers.push(resolve); }));
+    // Track pending fetches per URL: the global call count and positional
+    // resolvers can be poisoned by a stray call from a stale module task,
+    // which would leave `third` unresolved instead of failing fast.
+    const pendingFetches: Array<{ href: string; resolve: (response: Response) => void }> = [];
+    fetchMock.mockImplementation(input => new Promise<Response>(resolve => {
+      pendingFetches.push({ href: String(input), resolve });
+    }));
+    const fetchesFor = (href: string) => pendingFetches.filter(call => call.href === href);
     let targetGranted = true;
     vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) =>
       Promise.resolve(!origins.includes('https://destination.example.com/*') || targetGranted));
@@ -521,18 +572,20 @@ describe('preview requests', () => {
     const url = `${origin}/testflight`;
     const first = preview(url, 1);
     const second = preview(url, 2);
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(fetchesFor(url)).toHaveLength(1));
     targetGranted = false;
-    resolvers[0]?.(htmlResponse());
+    onRemoved()?.({ origins: ['https://destination.example.com/*'], permissions: [] });
+    fetchesFor(url)[0]?.resolve(htmlResponse());
 
     expect(await first).toMatchObject({ ok: false, code: 'permission' });
     expect(await second).toMatchObject({ ok: false, code: 'permission' });
 
     // Restoring access must refetch: the revoked flight never reached the cache.
     targetGranted = true;
+    onAdded()?.({ origins: ['https://destination.example.com/*'], permissions: [] });
     const third = preview(url, 3);
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    resolvers[1]?.(htmlResponse());
+    await vi.waitFor(() => expect(fetchesFor(url)).toHaveLength(2));
+    fetchesFor(url)[1]?.resolve(htmlResponse());
     expect(await third).toMatchObject({ ok: true });
   });
 
@@ -636,20 +689,14 @@ describe('preview requests', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('honors a cancel received during the final destination recheck', async () => {
-    const destResolvers: Array<(granted: boolean) => void> = [];
-    let destCalls = 0;
-    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
-      if (!origins.includes('https://destination.example.com/*')) return Promise.resolve(true);
-      destCalls += 1;
-      return destCalls <= 2 ? Promise.resolve(true) : new Promise<boolean>(resolve => { destResolvers.push(resolve); });
-    });
-    fetchMock.mockImplementation(() => Promise.resolve(htmlResponse()));
+  it('honors a cancel that lands between the fetch resolving and delivery', async () => {
+    let releaseFetch!: (response: Response) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { releaseFetch = resolve; }));
 
     const result = preview(`${origin}/testflight`, 41);
-    await vi.waitFor(() => expect(destCalls).toBe(3));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    releaseFetch(htmlResponse());
     cancel(41);
-    destResolvers[0]?.(true);
 
     expect(await result).toMatchObject({ ok: false, code: 'cancelled' });
   });
@@ -750,6 +797,8 @@ describe('preview requests', () => {
   });
 
   it('returns cancelled when a cancel lands during the final source recheck', async () => {
+    let releaseFetch!: (response: Response) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { releaseFetch = resolve; }));
     const resolvers: Array<(granted: boolean) => void> = [];
     let sourceCalls = 0;
     vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
@@ -757,9 +806,13 @@ describe('preview requests', () => {
       sourceCalls += 1;
       return sourceCalls === 1 ? Promise.resolve(true) : new Promise<boolean>(resolve => { resolvers.push(resolve); });
     });
-    fetchMock.mockImplementation(() => Promise.resolve(htmlResponse()));
 
     const result = preview(`${origin}/testflight`, 51);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // An unrelated revocation refreshes the grant cache, so the delivery
+    // recheck re-queries the source grant instead of serving it from cache.
+    onRemoved()?.({ origins: ['https://unrelated.example.com/*'], permissions: [] });
+    releaseFetch(htmlResponse());
     await vi.waitFor(() => expect(sourceCalls).toBe(2));
     cancel(51);
     resolvers[0]?.(false);
@@ -768,6 +821,8 @@ describe('preview requests', () => {
   });
 
   it('denies a request whose source recheck resolves without the grant', async () => {
+    let releaseFetch!: (response: Response) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { releaseFetch = resolve; }));
     const resolvers: Array<(granted: boolean) => void> = [];
     let sourceCalls = 0;
     vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
@@ -775,9 +830,11 @@ describe('preview requests', () => {
       sourceCalls += 1;
       return sourceCalls === 1 ? Promise.resolve(true) : new Promise<boolean>(resolve => { resolvers.push(resolve); });
     });
-    fetchMock.mockImplementation(() => Promise.resolve(htmlResponse()));
 
     const result = preview(`${origin}/testflight`, 52);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    onRemoved()?.({ origins: ['https://unrelated.example.com/*'], permissions: [] });
+    releaseFetch(htmlResponse());
     await vi.waitFor(() => expect(sourceCalls).toBe(2));
     resolvers[0]?.(false);
 
@@ -785,23 +842,25 @@ describe('preview requests', () => {
   });
 
   it('denies delivery when the destination grant is removed during the final recheck', async () => {
-    const revoked = new Set<string>();
-    const sourceResolvers: Array<(granted: boolean) => void> = [];
-    let sourceCalls = 0;
+    let releaseFetch!: (response: Response) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { releaseFetch = resolve; }));
+    const destResolvers: Array<(granted: boolean) => void> = [];
+    let destCalls = 0;
     vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
-      if (!origins.includes('https://source.example.com/*')) {
-        return Promise.resolve(!origins.some(o => revoked.has(o)));
-      }
-      sourceCalls += 1;
-      return sourceCalls === 1 ? Promise.resolve(true) : new Promise<boolean>(resolve => { sourceResolvers.push(resolve); });
+      if (!origins.includes('https://destination.example.com/*')) return Promise.resolve(true);
+      destCalls += 1;
+      return destCalls === 1 ? Promise.resolve(true) : new Promise<boolean>(resolve => { destResolvers.push(resolve); });
     });
-    fetchMock.mockImplementation(() => Promise.resolve(htmlResponse()));
 
     const result = preview(`${origin}/testflight`, 61);
-    await vi.waitFor(() => expect(sourceCalls).toBe(2));
-    revoked.add('https://destination.example.com/*');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // An unrelated revocation refreshes the grant cache so the recheck after
+    // the fetch becomes a real query again.
+    onRemoved()?.({ origins: ['https://unrelated.example.com/*'], permissions: [] });
+    releaseFetch(htmlResponse());
+    await vi.waitFor(() => expect(destCalls).toBe(2));
     onRemoved()?.({ origins: ['https://destination.example.com/*'], permissions: [] });
-    sourceResolvers[0]?.(true);
+    destResolvers[0]?.(true);
 
     expect(await result).toMatchObject({ ok: false, code: 'permission' });
   });
@@ -865,40 +924,28 @@ describe('preview requests', () => {
   });
 
   it('keeps a live cancellation over revocation and tombstone churn', async () => {
-    const sourceResolvers: Array<(granted: boolean) => void> = [];
-    let sourceCalls = 0;
-    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
-      if (!origins.includes('https://source.example.com/*')) return Promise.resolve(true);
-      sourceCalls += 1;
-      return sourceCalls === 1 ? Promise.resolve(true) : new Promise<boolean>(resolve => { sourceResolvers.push(resolve); });
-    });
-    fetchMock.mockImplementation(() => Promise.resolve(htmlResponse()));
+    const resolvers: Array<(response: Response) => void> = [];
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { resolvers.push(resolve); }));
 
     const result = preview(`${origin}/testflight`, 80);
-    await vi.waitFor(() => expect(sourceCalls).toBe(2));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     cancel(80);
     onRemoved()?.({ origins: ['https://destination.example.com/*'], permissions: [] });
     for (let i = 0; i < 520; i++) cancel(10_000 + i);
-    sourceResolvers[0]?.(true);
+    resolvers[0]?.(htmlResponse());
 
     expect(await result).toMatchObject({ ok: false, code: 'cancelled' });
   });
 
   it('keeps a revocation settlement over a later cancellation', async () => {
-    const sourceResolvers: Array<(granted: boolean) => void> = [];
-    let sourceCalls = 0;
-    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
-      if (!origins.includes('https://source.example.com/*')) return Promise.resolve(true);
-      sourceCalls += 1;
-      return sourceCalls === 1 ? Promise.resolve(true) : new Promise<boolean>(resolve => { sourceResolvers.push(resolve); });
-    });
-    fetchMock.mockImplementation(() => Promise.resolve(htmlResponse()));
+    const resolvers: Array<(response: Response) => void> = [];
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { resolvers.push(resolve); }));
 
     const result = preview(`${origin}/testflight`, 81);
-    await vi.waitFor(() => expect(sourceCalls).toBe(2));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     onRemoved()?.({ origins: ['https://destination.example.com/*'], permissions: [] });
     cancel(81);
-    sourceResolvers[0]?.(true);
+    resolvers[0]?.(htmlResponse());
 
     expect(await result).toMatchObject({ ok: false, code: 'permission' });
   });
@@ -1762,15 +1809,13 @@ describe('preview requests', () => {
     expect(await preview(`${origin}/`, 1)).toMatchObject({ ok: true });
     await tick();
 
-    const sessionSet = chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
-    const sessionGet = chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
-    const snapshot = sessionSet.mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+    const snapshot = previewCacheWrites().at(-1) as Record<string, unknown> | undefined;
     expect(snapshot?.['previewCache']).toHaveProperty(`${origin}/`);
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     // Simulate a cold service worker start with only session storage surviving.
     vi.resetModules();
-    sessionGet.mockResolvedValue(snapshot);
+    sessionGet().mockResolvedValue(snapshot);
     const { default: restarted } = await import('../entrypoints/background');
     restarted.main();
 
@@ -1783,15 +1828,13 @@ describe('preview requests', () => {
     expect(await preview(`${origin}/`, 1)).toMatchObject({ ok: true });
     onRemoved()?.({ origins: ['https://*.destination.example.com/*'] });
     await tick();
-    const sessionSet = chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
-    expect(sessionSet.mock.calls.at(-1)?.[0]).toEqual({ previewCache: {} });
+    expect(previewCacheWrites().at(-1)).toEqual({ previewCache: {} });
   });
 
   it('does not start a fetch when the request is cancelled during cache restore', async () => {
     vi.resetModules();
     let resolveGet!: (value: Record<string, unknown>) => void;
-    const sessionGet = chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
-    sessionGet.mockReturnValue(new Promise(resolve => { resolveGet = resolve; }));
+    sessionGet().mockReturnValue(new Promise(resolve => { resolveGet = resolve; }));
     const { default: restarted } = await import('../entrypoints/background');
     restarted.main();
 
@@ -1812,16 +1855,14 @@ describe('preview requests', () => {
     fetchMock.mockImplementation(async () => htmlResponse());
     expect(await preview(`${origin}/`, 1)).toMatchObject({ ok: true });
     await tick();
-    const sessionSet = chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
-    const snapshot = sessionSet.mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+    const snapshot = previewCacheWrites().at(-1) as Record<string, unknown> | undefined;
     expect(snapshot?.['previewCache']).toHaveProperty(`${origin}/`);
 
     // Simulate a cold start whose snapshot read is still pending when the
     // revocation event fires against the not-yet-restored cache.
     vi.resetModules();
     let resolveGet!: (value: unknown) => void;
-    const sessionGet = chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
-    sessionGet.mockReturnValue(new Promise(resolve => { resolveGet = resolve; }));
+    sessionGet().mockReturnValue(new Promise(resolve => { resolveGet = resolve; }));
     const { default: restarted } = await import('../entrypoints/background');
     restarted.main();
     onRemoved()?.({ origins: ['https://*.destination.example.com/*'] });
@@ -1829,8 +1870,233 @@ describe('preview requests', () => {
     await tick();
 
     // The revoked entry must be pruned from the restored cache and re-persisted.
-    expect(sessionSet.mock.calls.at(-1)?.[0]).toEqual({ previewCache: {} });
+    expect(previewCacheWrites().at(-1)).toEqual({ previewCache: {} });
     expect(await preview(`${origin}/`, 2)).toMatchObject({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('origin grant cache', () => {
+  it('shares one contains call between concurrent same-origin checks', async () => {
+    let releaseFetch!: (response: Response) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>(resolve => { releaseFetch = resolve; }));
+
+    const url = `${origin}/testflight`;
+    const first = preview(url, 1);
+    const second = preview(url, 2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    releaseFetch(htmlResponse());
+
+    expect(await first).toMatchObject({ ok: true });
+    expect(await second).toMatchObject({ ok: true });
+    // Admission, post-fetch, and delivery checks all share the one grant query.
+    expect(containsCallsFor('https://destination.example.com/*')).toBe(1);
+    expect(containsCallsFor('https://source.example.com/*')).toBe(1);
+  });
+
+  it('reuses resolved grants across previews until a permission event', async () => {
+    fetchMock.mockResolvedValue(htmlResponse());
+    const url = `${origin}/testflight`;
+    expect(await preview(url, 1)).toMatchObject({ ok: true });
+    const calls = vi.mocked(chrome.permissions.contains).mock.calls.length;
+
+    expect(await preview(url, 2)).toMatchObject({ ok: true });
+    expect(chrome.permissions.contains).toHaveBeenCalledTimes(calls);
+
+    onRemoved()?.({ origins: ['https://unrelated.example.com/*'], permissions: [] });
+    expect(await preview(url, 3)).toMatchObject({ ok: true });
+    expect(vi.mocked(chrome.permissions.contains).mock.calls.length).toBeGreaterThan(calls);
+  });
+
+  it('re-queries grants once a permission event invalidates them', async () => {
+    const granted = new Set(['https://source.example.com/*', 'https://destination.example.com/*']);
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) =>
+      Promise.resolve(origins.every(o => granted.has(o))));
+    fetchMock.mockResolvedValue(htmlResponse());
+    const url = `${origin}/testflight`;
+    expect(await preview(url, 1)).toMatchObject({ ok: true });
+    const calls = vi.mocked(chrome.permissions.contains).mock.calls.length;
+
+    granted.delete('https://destination.example.com/*');
+    onRemoved()?.({ origins: ['https://destination.example.com/*'], permissions: [] });
+
+    const result = preview(url, 2);
+    await vi.waitFor(() => expect(vi.mocked(chrome.permissions.contains).mock.calls.length).toBeGreaterThan(calls));
+    expect(await result).toMatchObject({ ok: false, code: 'permission' });
+  });
+
+  it('does not cache denials across calls', async () => {
+    const granted = new Set(['https://source.example.com/*']);
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) =>
+      Promise.resolve(origins.every(o => granted.has(o))));
+    const url = `${origin}/testflight`;
+    expect(await preview(url, 1)).toMatchObject({ ok: false, code: 'permission' });
+    const calls = vi.mocked(chrome.permissions.contains).mock.calls.length;
+
+    // Even without a grant event a later call must ask again — a stale denial
+    // can never outlive a freshly granted origin.
+    granted.add('https://destination.example.com/*');
+    fetchMock.mockResolvedValue(htmlResponse());
+    const second = preview(url, 2);
+    await vi.waitFor(() => expect(vi.mocked(chrome.permissions.contains).mock.calls.length).toBeGreaterThan(calls));
+    expect(await second).toMatchObject({ ok: true });
+  });
+
+  it('does not cache a transient permission IPC failure', async () => {
+    let destCalls = 0;
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
+      if (!origins.includes('https://destination.example.com/*')) return Promise.resolve(true);
+      destCalls += 1;
+      return destCalls === 1 ? Promise.reject(new Error('IPC dropped')) : Promise.resolve(true);
+    });
+    fetchMock.mockResolvedValue(htmlResponse());
+    const url = `${origin}/testflight`;
+
+    expect(await preview(url, 1)).toMatchObject({ ok: false, code: 'permission' });
+    expect(await preview(url, 2)).toMatchObject({ ok: true });
+  });
+});
+
+describe('content script registration', () => {
+  const REGISTER_KEY = 'registrationSnapshot';
+  const ORIGIN_A = 'https://a.example.com/*';
+  const ORIGIN_B = 'https://b.example.com/*';
+
+  function liveScript(matches: string[]): chrome.scripting.RegisteredContentScript {
+    return {
+      id: 'peeklink-preview',
+      js: ['preview.js'],
+      matches,
+      runAt: 'document_idle',
+      persistAcrossSessions: true,
+    };
+  }
+
+  async function restartWithSession(get: (key: string) => Promise<Record<string, unknown>>): Promise<void> {
+    // Let the startup sync that main() already scheduled finish so its work
+    // cannot interleave with the restarted worker's.
+    await tick();
+    vi.resetModules();
+    sessionGet().mockImplementation(get);
+    vi.mocked(chrome.scripting.getRegisteredContentScripts).mockClear();
+    vi.mocked(chrome.scripting.registerContentScripts).mockClear();
+    vi.mocked(chrome.scripting.updateContentScripts).mockClear();
+    vi.mocked(chrome.scripting.unregisterContentScripts).mockClear();
+    const { default: restarted } = await import('../entrypoints/background');
+    restarted.main();
+    await tick();
+    await tick();
+  }
+
+  it('skips the mutating IPCs when the live registration already matches the origins', async () => {
+    permissionsGetAll().mockResolvedValue({ origins: [ORIGIN_A] });
+    registeredScripts().mockResolvedValue([liveScript([ORIGIN_A])]);
+    await restartWithSession(() => Promise.resolve({}));
+    expect(chrome.scripting.getRegisteredContentScripts).toHaveBeenCalledTimes(1);
+    expect(chrome.scripting.registerContentScripts).not.toHaveBeenCalled();
+    expect(chrome.scripting.updateContentScripts).not.toHaveBeenCalled();
+    expect(chrome.scripting.unregisterContentScripts).not.toHaveBeenCalled();
+  });
+
+  it('registers the content script for the granted origins', async () => {
+    permissionsGetAll().mockResolvedValue({ origins: [ORIGIN_A] });
+    await restartWithSession(() => Promise.resolve({}));
+    expect(chrome.scripting.getRegisteredContentScripts).toHaveBeenCalledTimes(1);
+    expect(chrome.scripting.registerContentScripts).toHaveBeenCalledWith(
+      [expect.objectContaining({ id: 'peeklink-preview', matches: [ORIGIN_A] })]);
+    // Registration no longer leaves snapshot markers in session storage.
+    const markerWrites = sessionSet().mock.calls
+      .map(([value]) => value as Record<string, unknown>)
+      .filter(value => REGISTER_KEY in value);
+    expect(markerWrites).toEqual([]);
+  });
+
+  it('queries the live registration instead of trusting a stored fingerprint', async () => {
+    // A stored "completed" fingerprint once meant "skip every scripting IPC";
+    // a matching one must never suppress the live-state query again.
+    await restartWithSession(key => Promise.resolve(
+      key === REGISTER_KEY ? { [REGISTER_KEY]: '[]' } : {}));
+    expect(chrome.scripting.getRegisteredContentScripts).toHaveBeenCalled();
+  });
+
+  it('registers on a cold start that finds a stale complete fingerprint', async () => {
+    permissionsGetAll().mockResolvedValue({ origins: [ORIGIN_A] });
+    registeredScripts().mockResolvedValue([]);
+    await restartWithSession(key => Promise.resolve(
+      key === REGISTER_KEY ? { [REGISTER_KEY]: JSON.stringify([ORIGIN_A]) } : {}));
+    expect(chrome.scripting.registerContentScripts).toHaveBeenCalledWith(
+      [expect.objectContaining({ id: 'peeklink-preview', matches: [ORIGIN_A] })]);
+  });
+
+  it('re-registers a re-granted origin whose completed fingerprint went stale', async () => {
+    let origins = [ORIGIN_A];
+    let live: chrome.scripting.RegisteredContentScript[] = [liveScript([ORIGIN_A])];
+    permissionsGetAll().mockImplementation(() => Promise.resolve({ origins }));
+    registeredScripts().mockImplementation(() => Promise.resolve(live));
+    vi.mocked(chrome.scripting.registerContentScripts).mockImplementation(scripts => {
+      live = scripts;
+      return Promise.resolve();
+    });
+    vi.mocked(chrome.scripting.updateContentScripts).mockImplementation(scripts => {
+      live = scripts;
+      return Promise.resolve();
+    });
+    vi.mocked(chrome.scripting.unregisterContentScripts).mockImplementation(() => {
+      live = [];
+      return Promise.resolve();
+    });
+    // The complete fingerprint written when A was first synced outlives every
+    // later write — the outage that used to strand it.
+    sessionGet().mockImplementation(key => Promise.resolve(
+      key === REGISTER_KEY ? { [REGISTER_KEY]: JSON.stringify([ORIGIN_A]) } : {}));
+    sessionSet().mockRejectedValue(new Error('storage gone'));
+
+    // The revoke's unregister succeeds even though the snapshot cannot be
+    // rewritten — storage now disagrees with the real registration.
+    origins = [];
+    onRemoved()?.({ origins: [ORIGIN_A], permissions: [] });
+    await tick();
+    await tick();
+    expect(chrome.scripting.unregisterContentScripts).toHaveBeenCalledWith({ ids: ['peeklink-preview'] });
+    expect(live).toEqual([]);
+
+    // Storage recovers with the stale "complete" marker intact; the regrant
+    // must consult the live registration, find nothing, and register A.
+    sessionSet().mockResolvedValue(undefined);
+    origins = [ORIGIN_A];
+    onAdded()?.({ origins: [ORIGIN_A], permissions: [] });
+    await tick();
+    await tick();
+    expect(chrome.scripting.registerContentScripts).toHaveBeenCalledWith(
+      [expect.objectContaining({ id: 'peeklink-preview', matches: [ORIGIN_A] })]);
+  });
+
+  it('unregisters a script whose origins were revoked despite a stale snapshot', async () => {
+    permissionsGetAll().mockResolvedValue({ origins: [] });
+    registeredScripts().mockResolvedValue([liveScript([ORIGIN_A])]);
+    await restartWithSession(key => Promise.resolve(
+      key === REGISTER_KEY ? { [REGISTER_KEY]: JSON.stringify([ORIGIN_A]) } : {}));
+    expect(chrome.scripting.unregisterContentScripts).toHaveBeenCalledWith({ ids: ['peeklink-preview'] });
+  });
+
+  it('updates a live registration whose matches no longer equal the origins', async () => {
+    permissionsGetAll().mockResolvedValue({ origins: [ORIGIN_A, ORIGIN_B] });
+    registeredScripts().mockResolvedValue([liveScript([ORIGIN_A])]);
+    await restartWithSession(() => Promise.resolve({}));
+    expect(chrome.scripting.updateContentScripts).toHaveBeenCalledWith(
+      [expect.objectContaining({ id: 'peeklink-preview', matches: [ORIGIN_A, ORIGIN_B] })]);
+    expect(chrome.scripting.registerContentScripts).not.toHaveBeenCalled();
+  });
+
+  it('updates a live registration whose options differ from the desired script', async () => {
+    permissionsGetAll().mockResolvedValue({ origins: [ORIGIN_A] });
+    registeredScripts().mockResolvedValue([{ ...liveScript([ORIGIN_A]), allFrames: true }]);
+    await restartWithSession(() => Promise.resolve({}));
+    expect(chrome.scripting.updateContentScripts).toHaveBeenCalled();
+  });
+
+  it('still reconciles the registration when session storage fails', async () => {
+    await restartWithSession(() => Promise.reject(new Error('storage gone')));
+    expect(chrome.scripting.getRegisteredContentScripts).toHaveBeenCalled();
   });
 });

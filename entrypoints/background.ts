@@ -126,13 +126,23 @@ let anonymousWaiter = 0;
 const CONTENT_SCRIPT_ID = 'peeklink-preview';
 let registrationSync: Promise<void> = Promise.resolve();
 
+// The registration persists across browser sessions while the worker does
+// not, and the scripting API is the only trustworthy record of it. A stored
+// fingerprint could skip the live-state query instead, but any write failure
+// can leave a "completed" snapshot that no longer matches what is actually
+// registered — e.g. a revoke whose unregister lands while session storage is
+// down — and a stale hit then suppresses registration for the rest of the
+// browser session. So every sync reads the live registration and reconciles:
+// an identical registration skips the mutating IPCs, anything else registers,
+// updates, or unregisters.
 async function syncPreviewRegistration(): Promise<void> {
   const permissions = await chrome.permissions.getAll();
   const origins = permissions.origins ?? [];
-  const registered = await chrome.scripting.getRegisteredContentScripts({ ids: [CONTENT_SCRIPT_ID] });
+  const current = (await chrome.scripting.getRegisteredContentScripts({ ids: [CONTENT_SCRIPT_ID] }))
+    .find(script => script.id === CONTENT_SCRIPT_ID);
 
   if (origins.length === 0) {
-    if (registered.length > 0) await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] });
+    if (current) await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] });
     return;
   }
 
@@ -143,7 +153,17 @@ async function syncPreviewRegistration(): Promise<void> {
     runAt: 'document_idle' as const,
     persistAcrossSessions: true,
   };
-  if (registered.length > 0) await chrome.scripting.updateContentScripts([script]);
+
+  const inSync = current !== undefined
+    && JSON.stringify([...(current.matches ?? [])].sort()) === JSON.stringify([...origins].sort())
+    && JSON.stringify(current.js ?? []) === JSON.stringify(script.js)
+    && !(current.css?.length) && !(current.excludeMatches?.length)
+    && (current.runAt ?? 'document_idle') === script.runAt
+    && current.persistAcrossSessions === true
+    && !current.allFrames && !current.matchOriginAsFallback
+    && (current.world ?? 'ISOLATED') === 'ISOLATED';
+  if (inSync) return;
+  if (current) await chrome.scripting.updateContentScripts([script]);
   else await chrome.scripting.registerContentScripts([script]);
 }
 
@@ -1365,8 +1385,40 @@ function settleWaiter(waiterKey: string, state: 'cancelled' | 'source' | 'destin
   }
 }
 
+// Grant answers are cached per origin pattern for the worker's lifetime; a
+// permission event invalidates the whole map before anything else handles it.
+// A pending promise is shared, so parallel checks for one origin cost one IPC.
+// Only grants may outlive their call: a denial — or a failed IPC, which fails
+// closed — is re-queried next time rather than risking a stale "false".
+const originGrants = new Map<string, Promise<boolean>>();
+
+function invalidateOriginGrants(): void {
+  originGrants.clear();
+}
+
 async function hasOriginPermission(url: URL): Promise<boolean> {
-  return chrome.permissions.contains({ origins: [urlOriginPattern(url)] }).catch(() => false);
+  const pattern = urlOriginPattern(url);
+  const pending = originGrants.get(pattern);
+  if (pending) return pending;
+  const query = chrome.permissions.contains({ origins: [pattern] }).then(
+    granted => {
+      // An evicted entry is only removed while this query is still the map's
+      // own: after an invalidation the get() guard fails, so a stale promise
+      // cannot drop a fresher query for the same pattern.
+      if (!granted && originGrants.get(pattern) === query) originGrants.delete(pattern);
+      return granted;
+    },
+    () => {
+      if (originGrants.get(pattern) === query) originGrants.delete(pattern);
+      return false;
+    },
+  );
+  originGrants.set(pattern, query);
+  if (originGrants.size > 512) {
+    const oldest = originGrants.keys().next().value;
+    if (oldest !== undefined) originGrants.delete(oldest);
+  }
+  return query;
 }
 
 function startLoad(url: URL): PendingPreview {
@@ -1509,8 +1561,14 @@ async function handlePreviewRequest(url: string, sourceUrl: string | undefined, 
 export default defineBackground(() => {
   void ensureCacheRestored();
   schedulePreviewRegistration();
-  chrome.permissions.onAdded.addListener(schedulePreviewRegistration);
+  chrome.permissions.onAdded.addListener(() => {
+    invalidateOriginGrants();
+    schedulePreviewRegistration();
+  });
   chrome.permissions.onRemoved.addListener(permissions => {
+    // Invalidate first: a still-running query that resolves later must not be
+    // treated as current, and nothing below may answer from stale grants.
+    invalidateOriginGrants();
     dropRevokedOrigins(permissions.origins ?? []);
     schedulePreviewRegistration();
   });
