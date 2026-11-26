@@ -185,18 +185,35 @@ function originMatchesPattern(url: URL, pattern: string): boolean {
   return host === wantedHost;
 }
 
-function dropRevokedOrigins(patterns: string[]): void {
-  if (patterns.length === 0) return;
-  const revoked = (key: string) => {
+function originRevocationPredicate(patterns: string[]): (key: string) => boolean {
+  return (key: string) => {
     try {
       return patterns.some(pattern => originMatchesPattern(new URL(key), pattern));
     } catch {
       return false;
     }
   };
+}
+
+function pruneCacheForRevokedOrigins(revoked: (key: string) => boolean): boolean {
+  let dropped = false;
   for (const [key, entry] of cache) {
-    if (revoked(key) || entry.targets.some(revoked)) cache.delete(key);
+    if (revoked(key) || entry.targets.some(revoked)) {
+      cache.delete(key);
+      dropped = true;
+    }
   }
+  return dropped;
+}
+
+function dropRevokedOrigins(patterns: string[]): void {
+  if (patterns.length === 0) return;
+  // A revocation that arrives while the session snapshot is still loading
+  // prunes a cache the restored entries are not part of yet; remember it so
+  // ensureCacheRestored can apply it to the imported entries too.
+  pendingRevokedPatterns?.push(...patterns);
+  const revoked = originRevocationPredicate(patterns);
+  if (pruneCacheForRevokedOrigins(revoked)) persistCache();
   // Revoked grants settle matching waiters for the rest of the request
   // lifetime — a later regrant cannot revive them.
   for (const [waiterKey, source] of waiterSources) {
@@ -1211,6 +1228,76 @@ function readCacheEntry(key: string): CachedPreview | undefined {
   return hit;
 }
 
+const SESSION_CACHE_KEY = 'previewCache';
+let cacheRestore: Promise<void> | undefined;
+// Revocations observed until the session snapshot finishes restoring; null
+// afterwards. See dropRevokedOrigins and ensureCacheRestored.
+let pendingRevokedPatterns: string[] | null = [];
+
+function sessionCacheArea(): chrome.storage.StorageArea | undefined {
+  try {
+    return chrome.storage?.session;
+  } catch {
+    return undefined;
+  }
+}
+
+function isCachedPreview(value: unknown): value is CachedPreview {
+  if (!value || typeof value !== 'object') return false;
+  const entry = value as Partial<CachedPreview>;
+  return typeof entry.expires === 'number'
+    && Array.isArray(entry.targets) && entry.targets.every(target => typeof target === 'string')
+    && Boolean(entry.response) && typeof entry.response === 'object' && typeof entry.response.ok === 'boolean';
+}
+
+// The in-memory cache dies with the service worker (~30s idle in MV3), which
+// would cut the 15-minute TTL down to about a minute of real reuse. Mirror it
+// to session storage — memory-backed, cleared with the browser session — and
+// restore it on the next cold start.
+function ensureCacheRestored(): Promise<void> {
+  cacheRestore ??= (async () => {
+    const area = sessionCacheArea();
+    if (!area) {
+      pendingRevokedPatterns = null;
+      return;
+    }
+    try {
+      const stored: unknown = (await area.get(SESSION_CACHE_KEY))[SESSION_CACHE_KEY];
+      if (stored && typeof stored === 'object') {
+        const now = Date.now();
+        for (const [key, entry] of Object.entries(stored)) {
+          // Live entries written since startup are fresher than the snapshot.
+          if (cache.has(key) || !isCachedPreview(entry) || entry.expires <= now) continue;
+          cache.set(key, entry);
+        }
+      }
+      // Revocations that fired while the snapshot was loading pruned a cache
+      // these entries were not part of; apply them before serving anything.
+      if (pendingRevokedPatterns?.length && pruneCacheForRevokedOrigins(originRevocationPredicate(pendingRevokedPatterns))) {
+        const snapshot: Record<string, CachedPreview> = {};
+        for (const [key, entry] of cache) snapshot[key] = entry;
+        await area.set({ [SESSION_CACHE_KEY]: snapshot }).catch(() => undefined);
+      }
+    } catch {
+      // Session storage is best-effort; the in-memory cache still works.
+    } finally {
+      pendingRevokedPatterns = null;
+    }
+  })();
+  return cacheRestore;
+}
+
+function persistCache(): void {
+  const area = sessionCacheArea();
+  if (!area) return;
+  // Wait out any pending restore so the snapshot never drops restored entries.
+  void ensureCacheRestored().then(() => {
+    const snapshot: Record<string, CachedPreview> = {};
+    for (const [key, entry] of cache) snapshot[key] = entry;
+    return area.set({ [SESSION_CACHE_KEY]: snapshot });
+  }).catch(() => undefined);
+}
+
 function writeCache(key: string, response: PreviewResponse, targets = [key]): void {
   cache.delete(key);
   cache.set(key, { response, expires: Date.now() + (response.ok ? SUCCESS_TTL : FAILURE_TTL), targets });
@@ -1223,6 +1310,7 @@ function writeCache(key: string, response: PreviewResponse, targets = [key]): vo
     if (typeof oldest !== 'string') break;
     cache.delete(oldest);
   }
+  persistCache();
 }
 
 const PERMISSION_DENIED: PreviewResponse = {
@@ -1292,6 +1380,11 @@ function startLoad(url: URL): PendingPreview {
   pending.set(url.href, entry);
   entry.promise = (async () => {
     try {
+      await ensureCacheRestored();
+      // Cancellation or revocation while the session snapshot was loading
+      // detached this entry before the fetch existed; every detach path
+      // removes it from `pending`, so don't fetch for waiters that are gone.
+      if (pending.get(url.href) !== entry) return CANCELLED;
       const cached = readCacheEntry(url.href);
       if (cached) {
         for (const target of cached.targets) entry.targets.add(target);
@@ -1414,6 +1507,7 @@ async function handlePreviewRequest(url: string, sourceUrl: string | undefined, 
 }
 
 export default defineBackground(() => {
+  void ensureCacheRestored();
   schedulePreviewRegistration();
   chrome.permissions.onAdded.addListener(schedulePreviewRegistration);
   chrome.permissions.onRemoved.addListener(permissions => {
@@ -1443,7 +1537,7 @@ export default defineBackground(() => {
       void chrome.runtime.openOptionsPage();
       return false;
     }
-    if (message.type !== 'PEEKLINK_PREVIEW' || !sender.tab?.id) return false;
+    if ((message.type !== 'PEEKLINK_PREVIEW' && message.type !== 'PEEKLINK_PREFETCH') || !sender.tab?.id) return false;
     const url = 'url' in message ? message.url : undefined;
     if (typeof url !== 'string') return false;
     const waiterKey = `${owner}:${'requestId' in message && typeof message.requestId === 'number' ? message.requestId : `anon-${++anonymousWaiter}`}`;
