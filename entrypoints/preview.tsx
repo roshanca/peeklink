@@ -9,6 +9,10 @@ import { getSettings, isWebsiteAllowed, normalizeSettings, type PeekSettings } f
 import type { PreviewResponse } from '../lib/types';
 import css from './link-preview.css?inline';
 
+// Start fetching once the pointer dwells this long, so the network round trip
+// overlaps the configured popup delay instead of only starting after it.
+const PREFETCH_DWELL = 120;
+
 export default defineUnlistedScript(() => {
   if (document.getElementById('peeklink-root')) return;
   const host = document.createElement('div');
@@ -32,6 +36,8 @@ export default defineUnlistedScript(() => {
   let armedLink: HTMLAnchorElement | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
+  let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
+  let inflightPrefetchId: number | null = null;
   let cleanupPosition: (() => void) | undefined;
   let updatePosition: (() => Promise<void>) | undefined;
   let closing: { fade: Animation; resumableLink: HTMLAnchorElement | null } | undefined;
@@ -54,6 +60,34 @@ export default defineUnlistedScript(() => {
   function clearTimers() {
     clearTimeout(timer);
     clearTimeout(closeTimer);
+    clearTimeout(prefetchTimer);
+  }
+
+  function cancelPrefetch(expectedId?: number | null) {
+    const id = inflightPrefetchId;
+    if (id === null || (expectedId !== undefined && id !== expectedId)) return;
+    inflightPrefetchId = null;
+    try {
+      void chrome.runtime.sendMessage({ type: 'PEEKLINK_CANCEL', requestId: id }).catch(() => undefined);
+    } catch {
+      // The extension context may already be gone.
+    }
+  }
+
+  // Fetch the hovered link ahead of the popup delay; the background dedupes
+  // by URL, so the later preview request joins this same in-flight fetch.
+  function startPrefetch(link: HTMLAnchorElement) {
+    prefetchTimer = undefined;
+    if (active !== link || !link.isConnected || inflightId !== null || inflightPrefetchId !== null) return;
+    const id = ++requestId;
+    inflightPrefetchId = id;
+    try {
+      void chrome.runtime.sendMessage({ type: 'PEEKLINK_PREFETCH', url: link.href, requestId: id })
+        .catch(() => undefined)
+        .finally(() => { if (inflightPrefetchId === id) inflightPrefetchId = null; });
+    } catch {
+      inflightPrefetchId = null;
+    }
   }
 
   function invalidateRequest() {
@@ -89,9 +123,13 @@ export default defineUnlistedScript(() => {
   }
 
   function close(resumable = false) {
+    // This fade may finish after another link has armed its own prefetch;
+    // terminal cleanup may only cancel the request owned by this closure.
+    const closingPrefetchId = inflightPrefetchId;
     clearTimers();
     if (!resumable) {
       invalidateRequest();
+      cancelPrefetch();
       active = null;
     }
     hoveringPopup = false;
@@ -106,6 +144,7 @@ export default defineUnlistedScript(() => {
       animation instanceof CSSTransition && animation.transitionProperty === 'opacity');
     if (!fade) {
       active = null;
+      cancelPrefetch(closingPrefetchId);
       resetPopup();
       return;
     }
@@ -113,6 +152,9 @@ export default defineUnlistedScript(() => {
     const finish = () => {
       if (closing?.fade !== fade) return;
       if (active === closing.resumableLink) active = null;
+      // Closure became final: a still-running prefetch (slow fetch) must not
+      // keep a background waiter alive after the popup is gone.
+      cancelPrefetch(closingPrefetchId);
       resetPopup();
     };
     void fade.finished.then(finish, finish);
@@ -218,6 +260,9 @@ export default defineUnlistedScript(() => {
     clearTimers();
     if (active) close();
     active = link;
+    if (currentSettings.delay > PREFETCH_DWELL) {
+      prefetchTimer = setTimeout(() => startPrefetch(link), PREFETCH_DWELL);
+    }
     timer = setTimeout(() => { void show(link); }, currentSettings.delay);
   }
 

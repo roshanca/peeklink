@@ -39,7 +39,7 @@ function htmlResponse() {
 }
 
 function preview(url: string, requestId?: number, source = 'https://source.example.com', tabId = 1): Promise<PreviewResponse> {
-  const listener = addListener.mock.calls[0]?.[0];
+  const listener = addListener.mock.calls.at(-1)?.[0];
   if (!listener) throw new Error('Missing preview message listener');
   return new Promise(resolve => {
     listener(
@@ -50,8 +50,20 @@ function preview(url: string, requestId?: number, source = 'https://source.examp
   });
 }
 
+function prefetch(url: string, requestId?: number, source = 'https://source.example.com', tabId = 1): Promise<PreviewResponse> {
+  const listener = addListener.mock.calls.at(-1)?.[0];
+  if (!listener) throw new Error('Missing preview message listener');
+  return new Promise(resolve => {
+    listener(
+      { type: 'PEEKLINK_PREFETCH', url, requestId },
+      { id: 'peeklink', tab: { id: tabId, url: source } },
+      resolve,
+    );
+  });
+}
+
 function cancel(requestId: number): void {
-  const listener = addListener.mock.calls[0]?.[0];
+  const listener = addListener.mock.calls.at(-1)?.[0];
   listener?.(
     { type: 'PEEKLINK_CANCEL', requestId },
     { id: 'peeklink', tab: { id: 1, url: 'https://source.example.com' } },
@@ -60,7 +72,7 @@ function cancel(requestId: number): void {
 }
 
 function onRemoved(): ((permissions: { origins?: string[]; permissions?: string[] }) => void) | undefined {
-  return vi.mocked(chrome.permissions.onRemoved.addListener).mock.calls[0]?.[0];
+  return vi.mocked(chrome.permissions.onRemoved.addListener).mock.calls.at(-1)?.[0];
 }
 
 function tabRemoved(tabId: number): void {
@@ -99,6 +111,12 @@ beforeEach(async () => {
     },
     tabs: { onRemoved: { addListener: vi.fn() } },
     action: { onClicked: { addListener: vi.fn() } },
+    storage: {
+      session: {
+        get: vi.fn().mockResolvedValue({}),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    },
   });
   const { default: background } = await import('../entrypoints/background');
   background.main();
@@ -1716,5 +1734,103 @@ describe('preview requests', () => {
     ]);
     fetchMock.mockResolvedValueOnce(new Response(bytes, { headers: { 'content-type': 'text/html' } }));
     expect(await preview(`${origin}/equiv`)).toMatchObject({ ok: true, data: { title: '中' } });
+  });
+
+  it('prefetches ahead of the popup and serves the later preview without refetching', async () => {
+    fetchMock.mockResolvedValue(htmlResponse());
+    expect(await prefetch(`${origin}/`, 11)).toMatchObject({ ok: true, data: { title: 'TestFlight beta' } });
+    expect(await preview(`${origin}/`, 12)).toMatchObject({ ok: true, data: { title: 'TestFlight beta' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('joins an in-flight prefetch instead of starting a second fetch', async () => {
+    let resolveFetch!: (response: Response) => void;
+    fetchMock.mockReturnValue(new Promise<Response>(resolve => { resolveFetch = resolve; }));
+    const prefetching = prefetch(`${origin}/`, 21);
+    await tick();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const previewing = preview(`${origin}/`, 22);
+    resolveFetch(htmlResponse());
+    expect(await prefetching).toMatchObject({ ok: true, data: { title: 'TestFlight beta' } });
+    expect(await previewing).toMatchObject({ ok: true, data: { title: 'TestFlight beta' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('mirrors the cache to session storage and restores it after a worker restart', async () => {
+    fetchMock.mockResolvedValue(htmlResponse());
+    expect(await preview(`${origin}/`, 1)).toMatchObject({ ok: true });
+    await tick();
+
+    const sessionSet = chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
+    const sessionGet = chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
+    const snapshot = sessionSet.mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+    expect(snapshot?.['previewCache']).toHaveProperty(`${origin}/`);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Simulate a cold service worker start with only session storage surviving.
+    vi.resetModules();
+    sessionGet.mockResolvedValue(snapshot);
+    const { default: restarted } = await import('../entrypoints/background');
+    restarted.main();
+
+    expect(await preview(`${origin}/`, 2)).toMatchObject({ ok: true, data: { title: 'TestFlight beta' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops revoked origins from the persisted cache snapshot', async () => {
+    fetchMock.mockResolvedValue(htmlResponse());
+    expect(await preview(`${origin}/`, 1)).toMatchObject({ ok: true });
+    onRemoved()?.({ origins: ['https://*.destination.example.com/*'] });
+    await tick();
+    const sessionSet = chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
+    expect(sessionSet.mock.calls.at(-1)?.[0]).toEqual({ previewCache: {} });
+  });
+
+  it('does not start a fetch when the request is cancelled during cache restore', async () => {
+    vi.resetModules();
+    let resolveGet!: (value: Record<string, unknown>) => void;
+    const sessionGet = chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
+    sessionGet.mockReturnValue(new Promise(resolve => { resolveGet = resolve; }));
+    const { default: restarted } = await import('../entrypoints/background');
+    restarted.main();
+
+    const request = preview(`${origin}/`, 5);
+    // Let the source and destination permission checks finish so startLoad is
+    // blocked on the session restore before cancellation arrives.
+    await tick();
+    expect(chrome.permissions.contains).toHaveBeenCalledTimes(2);
+    cancel(5);
+    // The cancel resolves promptly even though the restore read is pending.
+    expect(await request).toMatchObject({ ok: false, code: 'cancelled' });
+    resolveGet({});
+    await tick();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('applies revocations that arrive while the session cache is restoring', async () => {
+    fetchMock.mockImplementation(async () => htmlResponse());
+    expect(await preview(`${origin}/`, 1)).toMatchObject({ ok: true });
+    await tick();
+    const sessionSet = chrome.storage.session.set as unknown as ReturnType<typeof vi.fn>;
+    const snapshot = sessionSet.mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+    expect(snapshot?.['previewCache']).toHaveProperty(`${origin}/`);
+
+    // Simulate a cold start whose snapshot read is still pending when the
+    // revocation event fires against the not-yet-restored cache.
+    vi.resetModules();
+    let resolveGet!: (value: unknown) => void;
+    const sessionGet = chrome.storage.session.get as unknown as ReturnType<typeof vi.fn>;
+    sessionGet.mockReturnValue(new Promise(resolve => { resolveGet = resolve; }));
+    const { default: restarted } = await import('../entrypoints/background');
+    restarted.main();
+    onRemoved()?.({ origins: ['https://*.destination.example.com/*'] });
+    resolveGet(snapshot);
+    await tick();
+
+    // The revoked entry must be pruned from the restored cache and re-persisted.
+    expect(sessionSet.mock.calls.at(-1)?.[0]).toEqual({ previewCache: {} });
+    expect(await preview(`${origin}/`, 2)).toMatchObject({ ok: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
