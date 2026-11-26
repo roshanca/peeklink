@@ -1,7 +1,6 @@
 import { defineUnlistedScript } from '#imports';
-import React from 'react';
-import { flushSync } from 'react-dom';
-import { createRoot } from 'react-dom/client';
+import { flushSync } from 'preact/compat';
+import { createRoot } from 'preact/compat/client';
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom';
 import { PreviewCard } from '../components/PreviewCard';
 import { canPreviewTarget, previewMediaSelector } from '../lib/preview-target';

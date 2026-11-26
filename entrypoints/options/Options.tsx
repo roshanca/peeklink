@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'preact/hooks';
+import type { TargetedEvent } from 'preact';
 import { websiteOriginPattern } from '../../lib/permissions';
 import { parseTargetRules } from '../../lib/preview-target';
 import {
@@ -53,7 +54,7 @@ export function Options() {
     setSettings(current => ({ ...current, [key]: value }));
   }
 
-  async function submit(event: React.FormEvent) {
+  async function submit(event: TargetedEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus('');
     setError('');
@@ -138,7 +139,7 @@ export function Options() {
       <h3>Or allow an individual website</h3>
       <div className="permission-form">
         <label className="field">Website
-          <input type="text" value={site} onChange={event => setSite(event.target.value)} placeholder="example.com" />
+          <input type="text" value={site} onChange={event => setSite(event.currentTarget.value)} placeholder="example.com" />
         </label>
         <button type="button" onClick={grantAccess}>Allow website</button>
       </div>
@@ -155,18 +156,18 @@ export function Options() {
         <h2>Preview trigger</h2>
         <label className="field">Preview mode
           <small>Webpage mode loads an interactive iframe when the destination allows it, and falls back to metadata otherwise.</small>
-          <select value={settings.mode} onChange={event => update('mode', event.target.value as PeekSettings['mode'])}>
+          <select value={settings.mode} onChange={event => update('mode', event.currentTarget.value as PeekSettings['mode'])}>
             <option value="metadata">Metadata card</option>
             <option value="webpage">Interactive webpage</option>
           </select>
         </label>
         <label className="checkbox">
-          <input type="checkbox" checked={settings.requireOption} onChange={event => update('requireOption', event.target.checked)} />
+          <input type="checkbox" checked={settings.requireOption} onChange={event => update('requireOption', event.currentTarget.checked)} />
           Require holding Option (Alt) while hovering
         </label>
         <label className="field">Trigger delay (milliseconds)
           <small>Use a longer delay to avoid requests during casual mouse movement. Maximum: 3000ms.</small>
-          <input type="number" min="0" max="3000" step="50" value={settings.delay} onChange={event => update('delay', Number(event.target.value))} />
+          <input type="number" min="0" max="3000" step="50" value={settings.delay} onChange={event => update('delay', Number(event.currentTarget.value))} />
         </label>
       </section>
 
@@ -175,15 +176,15 @@ export function Options() {
         <p>Rules apply to the current page and include subdomains. The blocklist always wins. When the allowlist is not empty, all unlisted websites are disabled.</p>
         <label className="field">Allowlist
           <small>One hostname per line, for example developer.mozilla.org</small>
-          <textarea value={allowlist} onChange={event => setAllowlist(event.target.value)} placeholder="Leave empty to allow all permitted websites" />
+          <textarea value={allowlist} onChange={event => setAllowlist(event.currentTarget.value)} placeholder="Leave empty to allow all permitted websites" />
         </label>
         <label className="field">Blocklist
           <small>One hostname per line, for example social.example.com</small>
-          <textarea value={blocklist} onChange={event => setBlocklist(event.target.value)} placeholder="No blocked websites" />
+          <textarea value={blocklist} onChange={event => setBlocklist(event.currentTarget.value)} placeholder="No blocked websites" />
         </label>
         <label className="field">Excluded link destinations
           <small>One rule per line. Use example.com for a domain and its subdomains, example.com/subscribe for an exact path, or example.com/media/* for paths under a directory. Query strings and fragments are ignored.</small>
-          <textarea value={excludedTargets} onChange={event => setExcludedTargets(event.target.value)} placeholder="example.com/media/*" />
+          <textarea value={excludedTargets} onChange={event => setExcludedTargets(event.currentTarget.value)} placeholder="example.com/media/*" />
         </label>
         <div className="actions">
           <button type="submit">Save settings</button>

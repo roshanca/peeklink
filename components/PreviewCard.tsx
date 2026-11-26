@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'preact/hooks';
 import type { FramePolicy, PreviewData, PreviewErrorCode, PreviewMode } from '../lib/types';
 
 type Props = {
@@ -48,7 +48,7 @@ function WebpageFrame({ url, hostname, onFailure }: { url: string; hostname: str
       className="peek-frame"
       src={url}
       title={`Interactive preview of ${hostname}`}
-      credentialless=""
+      credentialless
       sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
       referrerPolicy="no-referrer"
       onLoad={() => setLoaded(true)}

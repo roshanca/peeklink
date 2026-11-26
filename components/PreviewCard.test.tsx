@@ -1,5 +1,4 @@
-import React from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+import { renderToStaticMarkup } from 'preact-render-to-string';
 import { describe, expect, it } from 'vitest';
 import { PreviewCard } from './PreviewCard';
 
@@ -19,7 +18,7 @@ describe('PreviewCard iframe security attributes', () => {
       onOpenSettings={() => undefined}
     />);
 
-    expect(markup).toContain('credentialless=""');
+    expect(markup).toMatch(/credentialless(?=[\s/>])/);
     expect(markup).toContain('sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"');
     expect(markup).not.toContain('allow-same-origin');
   });
