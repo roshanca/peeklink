@@ -1,4 +1,4 @@
-# PeekLink v1.0.0
+# PeekLink v1.1.0
 
 Chrome MV3 link-preview extension, macOS + Arc hybrid style.
 
@@ -12,7 +12,8 @@ Chrome MV3 link-preview extension, macOS + Arc hybrid style.
 - One-time all-website authorization or individual website grants and revocation.
 - Dynamic content-script registration limited to granted origins.
 - In-flight request deduplication, four-request concurrency limit, and a bounded queue with a wait deadline. Closing a preview cancels its in-flight request.
-- In-memory LRU cache: 15 minutes for successful previews and 30 seconds for cacheable failures. Network errors, timeouts, permission failures, and queue saturation can be retried on the next hover.
+- Hover prefetch starts after a 120ms pointer dwell and shares its request with the later preview, overlapping network loading with the configured popup delay.
+- Session-persisted LRU cache: 15 minutes for successful previews and 30 seconds for cacheable failures, surviving service worker restarts within the browser session. Network errors, timeouts, permission failures, and queue saturation can be retried on the next hover.
 - Timeouts, HTML type validation, and readable errors. Pages are read only through the end of `<head>` (never more than 400KB), so heavy pages still yield their metadata instead of failing.
 - Redirect following capped at five hops, with public-address and per-hop permission validation.
 - Optional interactive webpage previews in a sandboxed, credentialless iframe.
@@ -78,4 +79,4 @@ The ZIP is written under `.output/`. Pushing a tag matching `v*.*.*` runs the re
 - Webpage mode is experimental. Frames use an opaque origin without `allow-same-origin`; sites that require origin storage, authenticated frames, frame-busting scripts, or fail to load within 12 seconds may fall back to metadata.
 - Private/local hostname and IP-literal targets are rejected. Browser extension fetch APIs do not expose resolved IP addresses, so URL checks alone cannot fully prevent DNS-rebinding attacks.
 - Metadata images still load directly with `referrerPolicy="no-referrer"`; background image proxying remains future privacy work.
-- The cache is memory-only and resets when the extension service worker stops.
+- The cache uses memory-backed session storage and clears when the browser session ends.
