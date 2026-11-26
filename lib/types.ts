@@ -23,7 +23,6 @@ export type PreviewErrorCode =
   | 'redirect'
   | 'http'
   | 'not-html'
-  | 'too-large'
   | 'queue-full'
   | 'network'
   | 'cancelled'

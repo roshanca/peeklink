@@ -12,8 +12,9 @@ Chrome MV3 link-preview extension, macOS + Arc hybrid style.
 - One-time all-website authorization or individual website grants and revocation.
 - Dynamic content-script registration limited to granted origins.
 - In-flight request deduplication, four-request concurrency limit, and a bounded queue with a wait deadline. Closing a preview cancels its in-flight request.
-- In-memory LRU cache: 15 minutes for successful previews and 30 seconds for cacheable failures. Network errors, timeouts, and queue saturation can be retried on the next hover.
-- Timeouts, HTML type validation, a 400KB streaming response cap, and readable errors.
+- In-memory LRU cache: 15 minutes for successful previews and 30 seconds for cacheable failures. Network errors, timeouts, permission failures, and queue saturation can be retried on the next hover.
+- Timeouts, HTML type validation, and readable errors. Pages are read only through the end of `<head>` (never more than 400KB), so heavy pages still yield their metadata instead of failing.
+- Redirect following capped at five hops, with public-address and per-hop permission validation.
 - Optional interactive webpage previews in a sandboxed, credentialless iframe.
 - X-Frame-Options and CSP frame-ancestors detection with metadata fallback.
 - Branded toolbar and extension icons in 16, 32, 48, and 128px sizes.
@@ -73,7 +74,7 @@ The ZIP is written under `.output/`. Pushing a tag matching `v*.*.*` runs the re
 
 - WXT 0.21.5, TypeScript 7.0.2, Vite 8, and Vitest 5.
 - Uses `#imports` for WXT entrypoint definitions.
-- Remote pages may block fetches or lack metadata. After a redirect, PeekLink can retry the same URL with the trailing slash added or removed. It does not follow the server's redirect destination.
+- Remote pages may block fetches or lack metadata. PeekLink follows redirects only when the browser exposes each target through `webRequest`; every hop is revalidated as a public HTTP(S) address and must be covered by granted website access before it is fetched. If that signal is unavailable, PeekLink can still retry the same URL with the trailing slash added or removed.
 - Webpage mode is experimental. Frames use an opaque origin without `allow-same-origin`; sites that require origin storage, authenticated frames, frame-busting scripts, or fail to load within 12 seconds may fall back to metadata.
 - Private/local hostname and IP-literal targets are rejected. Browser extension fetch APIs do not expose resolved IP addresses, so URL checks alone cannot fully prevent DNS-rebinding attacks.
 - Metadata images still load directly with `referrerPolicy="no-referrer"`; background image proxying remains future privacy work.

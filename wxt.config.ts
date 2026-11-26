@@ -10,7 +10,7 @@ export default defineConfig({
       48: 'icons/48.png',
       128: 'icons/128.png',
     },
-    permissions: ['storage', 'scripting'],
+    permissions: ['storage', 'scripting', 'webRequest'],
     optional_host_permissions: ['http://*/*', 'https://*/*'],
     action: {
       default_title: 'PeekLink',

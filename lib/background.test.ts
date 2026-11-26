@@ -12,6 +12,20 @@ type Listener = (
 const fetchMock = vi.fn<typeof fetch>();
 const addListener = vi.fn<(listener: Listener) => void>();
 const origin = 'https://destination.example.com';
+let redirectListener: ((details: chrome.webRequest.WebResponseHeadersDetails) => void) | undefined;
+
+function emitRedirect(url: string, redirectUrl: string, initiator = 'chrome-extension://peeklink'): void {
+  redirectListener?.({
+    url,
+    statusCode: 302,
+    responseHeaders: [{ name: 'location', value: redirectUrl }],
+    timeStamp: Date.now(),
+    method: 'GET',
+    type: 'xmlhttprequest',
+    tabId: -1,
+    initiator,
+  } as chrome.webRequest.WebResponseHeadersDetails);
+}
 
 function redirectResponse() {
   // Browsers filter manual redirects to status 0 without a readable Location header.
@@ -58,6 +72,7 @@ const tick = () => new Promise(resolve => { setTimeout(resolve, 0); });
 beforeEach(async () => {
   vi.resetModules();
   vi.resetAllMocks();
+  redirectListener = undefined;
   vi.stubGlobal('fetch', fetchMock);
   vi.stubGlobal('chrome', {
     permissions: {
@@ -67,7 +82,21 @@ beforeEach(async () => {
       onRemoved: { addListener: vi.fn() },
     },
     scripting: { getRegisteredContentScripts: vi.fn().mockResolvedValue([]) },
-    runtime: { id: 'peeklink', onMessage: { addListener } },
+    runtime: {
+      id: 'peeklink',
+      onMessage: { addListener },
+      getURL: (path: string) => `chrome-extension://peeklink/${path}`,
+    },
+    webRequest: {
+      onHeadersReceived: {
+        addListener: vi.fn((listener: (details: chrome.webRequest.WebResponseHeadersDetails) => void) => {
+          redirectListener = listener;
+        }),
+        removeListener: vi.fn((listener: (details: chrome.webRequest.WebResponseHeadersDetails) => void) => {
+          if (redirectListener === listener) redirectListener = undefined;
+        }),
+      },
+    },
     tabs: { onRemoved: { addListener: vi.fn() } },
     action: { onClicked: { addListener: vi.fn() } },
   });
@@ -100,12 +129,368 @@ describe('preview requests', () => {
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([`${origin}/testflight/`, `${origin}/testflight`]);
   });
 
+  it('follows a validated cross-host redirect and previews the final address', async () => {
+    const input = `${origin}/`;
+    const final = 'https://www.destination.example.com/';
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, final);
+        return redirectResponse();
+      }
+      return htmlResponse();
+    });
+
+    const result = await preview(input);
+    expect(result).toMatchObject({
+      ok: true,
+      data: { title: 'TestFlight beta', url: final, hostname: 'destination.example.com' },
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([input, final]);
+  });
+
+  it('resolves a relative redirect location against the current address', async () => {
+    const input = `${origin}/redirect`;
+    const final = `${origin}/final`;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, '/final');
+        return redirectResponse();
+      }
+      return htmlResponse();
+    });
+
+    expect(await preview(input)).toMatchObject({ ok: true, data: { url: final } });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([input, final]);
+  });
+
+  it('does not fetch a redirect target that has not been granted', async () => {
+    const input = `${origin}/`;
+    const final = 'https://redirected.example.com/';
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) =>
+      Promise.resolve(!origins.includes('https://redirected.example.com/*')));
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) emitRedirect(href, final);
+      return redirectResponse();
+    });
+
+    const result = await preview(input);
+    expect(result).toMatchObject({ ok: false, code: 'permission' });
+    expect(result.ok === false && result.error).toContain('redirected.example.com');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a redirect to a private network address before fetching it', async () => {
+    const input = `${origin}/`;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) emitRedirect(href, 'http://192.168.1.1/admin');
+      return redirectResponse();
+    });
+
+    expect(await preview(input)).toMatchObject({ ok: false, code: 'blocked-host' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an invalid redirect location without fetching it', async () => {
+    const input = `${origin}/`;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) emitRedirect(href, 'http://[::1');
+      return redirectResponse();
+    });
+
+    const result = await preview(input);
+    expect(result).toMatchObject({ ok: false, code: 'redirect' });
+    expect(result.ok === false && result.error).toContain('invalid address');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores redirect observations that did not come from the extension', async () => {
+    const input = `${origin}/`;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) emitRedirect(href, 'https://www.destination.example.com/', 'https://source.example.com');
+      return redirectResponse();
+    });
+
+    expect(await preview(input)).toMatchObject({ ok: false, code: 'redirect' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refetches a redirect target immediately after its permission is granted', async () => {
+    const input = `${origin}/`;
+    const final = 'https://redirected.example.com/';
+    let targetGranted = false;
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) =>
+      Promise.resolve(!origins.includes('https://redirected.example.com/*') || targetGranted));
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, final);
+        return redirectResponse();
+      }
+      return htmlResponse();
+    });
+
+    expect(await preview(input, 71)).toMatchObject({ ok: false, code: 'permission' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    targetGranted = true;
+    expect(await preview(input, 72)).toMatchObject({ ok: true, data: { url: final } });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([input, input, final]);
+  });
+
+  it('stops redirect loops', async () => {
+    const first = `${origin}/loop-a`;
+    const second = `${origin}/loop-b`;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === first) emitRedirect(href, second);
+      if (href === second) emitRedirect(href, first);
+      return redirectResponse();
+    });
+
+    const result = await preview(first);
+    expect(result).toMatchObject({ ok: false, code: 'redirect' });
+    expect(result.ok === false && result.error).toContain('loop');
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([first, second]);
+  });
+
+  it('stops after the redirect limit', async () => {
+    const start = `${origin}/r0`;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      const match = /^https:\/\/destination\.example\.com\/r(\d)$/.exec(href);
+      if (match) emitRedirect(href, `${origin}/r${Number(match[1]) + 1}`);
+      return redirectResponse();
+    });
+
+    const result = await preview(start);
+    expect(result).toMatchObject({ ok: false, code: 'redirect' });
+    expect(result.ok === false && result.error).toContain('too many times');
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+  });
+
+  it('evicts a cached redirect preview when the final host grant is removed', async () => {
+    const input = `${origin}/`;
+    const final = 'https://www.destination.example.com/';
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, final);
+        return redirectResponse();
+      }
+      return htmlResponse();
+    });
+
+    expect(await preview(input)).toMatchObject({ ok: true });
+    expect(await preview(input)).toMatchObject({ ok: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    onRemoved()?.({ origins: ['https://www.destination.example.com/*'], permissions: [] });
+
+    expect(await preview(input)).toMatchObject({ ok: true });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('cancels an in-flight redirect target when its grant is removed', async () => {
+    const input = `${origin}/`;
+    const final = 'https://www.destination.example.com/';
+    let finalSignal: AbortSignal | undefined;
+    fetchMock.mockImplementation((inputUrl, init) => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, final);
+        return Promise.resolve(redirectResponse());
+      }
+      finalSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    });
+
+    const result = preview(input, 70);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    onRemoved()?.({ origins: ['https://www.destination.example.com/*'], permissions: [] });
+
+    expect(await result).toMatchObject({ ok: false, code: 'permission' });
+    expect(finalSignal?.aborted).toBe(true);
+  });
+
+  it('denies delivery when the final redirect host is revoked during delivery rechecks', async () => {
+    const input = `${origin}/`;
+    const final = 'https://www.destination.example.com/';
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, final);
+        return redirectResponse();
+      }
+      return htmlResponse();
+    });
+    const sourceResolvers: Array<(granted: boolean) => void> = [];
+    let sourceCalls = 0;
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
+      if (origins.includes('https://source.example.com/*')) {
+        sourceCalls += 1;
+        if (sourceCalls === 2) return new Promise<boolean>(resolve => { sourceResolvers.push(resolve); });
+      }
+      return Promise.resolve(true);
+    });
+
+    const result = preview(input, 90);
+    await vi.waitFor(() => expect(sourceResolvers).toHaveLength(1));
+    onRemoved()?.({ origins: ['https://www.destination.example.com/*'], permissions: [] });
+    sourceResolvers[0]?.(true);
+
+    expect(await result).toMatchObject({ ok: false, code: 'permission' });
+  });
+
+  it('keeps a replacement flight tracked when a superseded flight finishes late', async () => {
+    const input = `${origin}/`;
+    const final = 'https://www.destination.example.com/';
+    let finalPermissionCalls = 0;
+    let releaseFirstPermission!: (granted: boolean) => void;
+    vi.mocked(chrome.permissions.contains).mockImplementation(({ origins = [] }) => {
+      if (origins.includes('https://www.destination.example.com/*')) {
+        finalPermissionCalls += 1;
+        if (finalPermissionCalls === 1) {
+          return new Promise<boolean>(resolve => { releaseFirstPermission = resolve; });
+        }
+      }
+      return Promise.resolve(true);
+    });
+    let finalSignal: AbortSignal | undefined;
+    let releaseFinal: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementation((inputUrl, init) => {
+      const href = String(inputUrl);
+      if (href === input) {
+        emitRedirect(href, final);
+        return Promise.resolve(redirectResponse());
+      }
+      finalSignal = init?.signal ?? undefined;
+      return new Promise<Response>((resolve, reject) => {
+        releaseFinal = resolve;
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    });
+
+    const first = preview(input, 91);
+    await vi.waitFor(() => expect(finalPermissionCalls).toBe(1));
+    cancel(91);
+    expect(await first).toMatchObject({ ok: false, code: 'cancelled' });
+
+    const second = preview(input, 92);
+    await vi.waitFor(() => expect(releaseFinal).toBeDefined());
+    // Let the superseded flight run its late cleanup before the revocation.
+    releaseFirstPermission(true);
+    await tick();
+    await tick();
+    onRemoved()?.({ origins: ['https://www.destination.example.com/*'], permissions: [] });
+
+    const aborted = finalSignal?.aborted;
+    releaseFinal?.(htmlResponse());
+    expect(await second).toMatchObject({ ok: false, code: 'permission' });
+    expect(aborted).toBe(true);
+  });
+
+  it('keeps concurrent redirect observations for a shared URL isolated', async () => {
+    const firstInput = `${origin}/first`;
+    const shared = 'https://shared.example.com/hop';
+    const firstFinal = 'https://first-final.example.com/';
+    const secondFinal = 'https://second-final.example.com/';
+    let sharedCalls = 0;
+    let releaseFirstShared!: (response: Response) => void;
+    fetchMock.mockImplementation(async inputUrl => {
+      const href = String(inputUrl);
+      if (href === firstInput) {
+        emitRedirect(href, shared);
+        return redirectResponse();
+      }
+      if (href === shared) {
+        sharedCalls += 1;
+        if (sharedCalls === 1) {
+          emitRedirect(shared, firstFinal);
+          return new Promise<Response>(resolve => { releaseFirstShared = resolve; });
+        }
+        emitRedirect(shared, secondFinal);
+        return redirectResponse();
+      }
+      return htmlResponse();
+    });
+
+    const first = preview(firstInput, 95);
+    await vi.waitFor(() => expect(sharedCalls).toBe(1));
+    const second = preview(shared, 96);
+    await tick();
+    await tick();
+    releaseFirstShared(redirectResponse());
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toMatchObject({ ok: true, data: { url: firstFinal } });
+    expect(secondResult).toMatchObject({ ok: true, data: { url: secondFinal } });
+  });
+
+  it('releases global concurrency slots when URL-lock waiters are cancelled', async () => {
+    const shared = 'https://shared.example.com/hop';
+    const fresh = `${origin}/fresh`;
+    let releaseOwner!: (response: Response) => void;
+    let freshStarted = false;
+    fetchMock.mockImplementation(async (inputUrl, init) => {
+      if (init?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const href = String(inputUrl);
+      if (href === shared) {
+        return new Promise<Response>((resolve, reject) => {
+          releaseOwner = resolve;
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        });
+      }
+      if (href === fresh) {
+        freshStarted = true;
+        return htmlResponse();
+      }
+      emitRedirect(href, shared);
+      return redirectResponse();
+    });
+
+    const owner = preview(shared, 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const waiters = [2, 3, 4].map(id => preview(`${origin}/r${id}`, id));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    // Let the waiters consume their redirects and queue on the shared URL lock.
+    await tick();
+    await tick();
+    [2, 3, 4].forEach(cancel);
+    expect(await Promise.all(waiters)).toEqual([
+      expect.objectContaining({ ok: false, code: 'cancelled' }),
+      expect.objectContaining({ ok: false, code: 'cancelled' }),
+      expect.objectContaining({ ok: false, code: 'cancelled' }),
+    ]);
+
+    const unrelated = preview(fresh, 5);
+    // The cancelled waiters must free their slots before the lock owner ends.
+    await vi.waitFor(() => expect(freshStarted).toBe(true));
+    releaseOwner(htmlResponse());
+    await owner;
+    expect(await unrelated).toMatchObject({ ok: true });
+  });
+
   it('allows the next hover to recover immediately after a transient failure', async () => {
     fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValueOnce(htmlResponse());
     const url = `${origin}/testflight`;
     expect(await preview(url)).toMatchObject({ ok: false, code: 'network' });
     expect(await preview(url)).toMatchObject({ ok: true, data: { title: 'TestFlight beta' } });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('removes the redirect observer when fetching settles', async () => {
+    fetchMock.mockResolvedValueOnce(htmlResponse());
+    expect(await preview(`${origin}/testflight`)).toMatchObject({ ok: true });
+    expect(chrome.webRequest.onHeadersReceived.addListener).toHaveBeenCalledTimes(1);
+    expect(chrome.webRequest.onHeadersReceived.removeListener).toHaveBeenCalledTimes(1);
   });
 
   it('applies a mid-flight revocation to shared waiters and skips the cache write', async () => {
@@ -597,6 +982,249 @@ describe('preview requests', () => {
     fetchMock.mockResolvedValueOnce(htmlResponse());
     expect(await preview(`${origin}/gone-later`, 88)).toMatchObject({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('previews a huge page when its head closes within the byte cap', async () => {
+    const head = '<title>Big page</title><meta property="og:description" content="heavy but fine"></head><body>';
+    const html = head + 'x'.repeat(500_000);
+    fetchMock.mockResolvedValueOnce(new Response(html, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/huge`)).toMatchObject({
+      ok: true,
+      data: { title: 'Big page', description: 'heavy but fine' },
+    });
+  });
+
+  // The stream errors once it is pulled past the metadata-bearing chunks, so
+  // these previews can only succeed if reading stops at the head end.
+  function headThenErrorStream(parts: string[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    let index = 0;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index < parts.length) {
+          controller.enqueue(encoder.encode(parts[index]));
+          index += 1;
+        } else {
+          controller.error(new Error('read past the head end'));
+        }
+      },
+    });
+  }
+
+  it('stops reading the body once the head end is seen', async () => {
+    const stream = headThenErrorStream(['<title>Early stop</title></head><body>']);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/early`)).toMatchObject({ ok: true, data: { title: 'Early stop' } });
+  });
+
+  it('detects a head end split across chunk boundaries', async () => {
+    const stream = headThenErrorStream(['<title>Split</title></he', 'ad><body>']);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/split`)).toMatchObject({ ok: true, data: { title: 'Split' } });
+  });
+
+  it('handles a head end delivered one byte at a time', async () => {
+    const parts = ['<title>Byte split</title>', ...'</head><body>'];
+    let index = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index < parts.length) controller.enqueue(new TextEncoder().encode(parts[index++]));
+        else controller.error(new Error('read past the head end'));
+      },
+    });
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/byte-split`)).toMatchObject({ ok: true, data: { title: 'Byte split' } });
+  });
+
+  it('ignores marker-like text inside head scripts', async () => {
+    const stream = headThenErrorStream([
+      '<head><script>const template = "<body class=example>";</script>',
+      '<title>Actual title</title><meta name="description" content="Actual description"></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/script-marker`)).toMatchObject({
+      ok: true, data: { title: 'Actual title', description: 'Actual description' },
+    });
+  });
+
+  it('ignores marker-like text inside head comments and attributes', async () => {
+    const stream = headThenErrorStream([
+      '<head><!-- <body> </head> --><meta content="</head><body>" name="x">',
+      '<title>Comment test</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/comment-marker`)).toMatchObject({ ok: true, data: { title: 'Comment test' } });
+  });
+
+  it('does not treat longer tag names with a head or body prefix as the head end', async () => {
+    const stream = headThenErrorStream([
+      '<title>Long names</title><bodyxyz>',
+      '<meta name="description" content="still head"></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/long-names`)).toMatchObject({
+      ok: true, data: { title: 'Long names', description: 'still head' },
+    });
+  });
+
+  it('keeps reading double-escaped script contents until the real script end', async () => {
+    const stream = headThenErrorStream([
+      '<head><script><!--\n<script>\nconst first = "</script>";\nconst second = "<body>";\n//--></script>',
+      '<title>Actual title</title><meta name="description" content="Actual description"></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/double-escaped-script`)).toMatchObject({
+      ok: true, data: { title: 'Actual title', description: 'Actual description' },
+    });
+  });
+
+  it('stops at the XHTML head end after a self-closing script', async () => {
+    const stream = headThenErrorStream([
+      '<html xmlns="http://www.w3.org/1999/xhtml"><head><script src="/app.js"/>',
+      '<title>XHTML title</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'application/xhtml+xml' } }));
+
+    expect(await preview(`${origin}/xhtml-script`)).toMatchObject({ ok: true, data: { title: 'XHTML title' } });
+  });
+
+  it('reconsumes a mismatching closing script candidate', async () => {
+    const stream = headThenErrorStream([
+      '<head><script><!--\nconst first="</s<script>";\nconst second="</script>";\nconst third="<body>";\n//--></script>',
+      '<title>Actual title</title><meta name="description" content="Actual description"></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/reconsume`)).toMatchObject({
+      ok: true, data: { title: 'Actual title', description: 'Actual description' },
+    });
+  });
+
+  it('exits script escaped state on an immediately closing comment', async () => {
+    const stream = headThenErrorStream([
+      '<head><script><!-->\nconst template="<script>";</script>',
+      '<title>Actual title</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/comment-exit`)).toMatchObject({ ok: true, data: { title: 'Actual title' } });
+  });
+
+  it.each([
+    '<!--<-->\nconst template="<script>";',
+    '<!--\nconst template="<script>";\nconst ending="<-->";',
+  ])('reconsumes a dash directly after an escaped less-than sign', async code => {
+    const stream = headThenErrorStream([
+      `<head><script>${code}</script>`,
+      '<title>Actual title</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/lt-dash`)).toMatchObject({ ok: true, data: { title: 'Actual title' } });
+  });
+
+  it('treats "<!-->" as an abruptly closed comment', async () => {
+    const stream = headThenErrorStream([
+      '<head><!--><script>var x = 1;</script>',
+      '<title>After comment</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/abrupt-comment`)).toMatchObject({ ok: true, data: { title: 'After comment' } });
+  });
+
+  it('skips bogus comments as a unit', async () => {
+    const stream = headThenErrorStream([
+      '<head><!foo <body>',
+      '<title>Bogus test</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/bogus-comment`)).toMatchObject({ ok: true, data: { title: 'Bogus test' } });
+  });
+
+  it('skips quoted attribute values inside end tags', async () => {
+    const stream = headThenErrorStream([
+      '<head><script>x</script data-x="> <body>">',
+      '<title>End tag attrs</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/end-tag-attrs`)).toMatchObject({ ok: true, data: { title: 'End tag attrs' } });
+  });
+
+  it('closes comments at "--!>" like browsers do', async () => {
+    const stream = headThenErrorStream([
+      '<head><!--comment--!><script>x</script>',
+      '<title>Bang close</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/bang-close`)).toMatchObject({ ok: true, data: { title: 'Bang close' } });
+  });
+
+  it.each([
+    ['<head><script>x</script data-x=foo">', '"'],
+    ["<head><script>x</script data-x=foo'>", "'"],
+  ])('ignores quotes inside unquoted end-tag attribute values', async (prefix) => {
+    const stream = headThenErrorStream([
+      prefix,
+      '<title>Unquoted attrs</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/unquoted-end-attrs`)).toMatchObject({ ok: true, data: { title: 'Unquoted attrs' } });
+  });
+
+  it('still skips properly quoted end-tag attribute values', async () => {
+    const stream = headThenErrorStream([
+      '<head><script>x</script data-x="> <body>">',
+      '<title>End tag attrs</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/quoted-end-attrs`)).toMatchObject({ ok: true, data: { title: 'End tag attrs' } });
+  });
+
+  it.each([
+    ['start tag', '<head><script ="foo>x</script>'],
+    ['start tag single-quote variant', "<head><script ='foo>x</script>"],
+    ['end tag', '<head><script>x</script ="foo>'],
+    ['end tag single-quote variant', "<head><script>x</script ='foo>"],
+  ])('treats a leading equals sign as part of a malformed %s attribute name', async (_kind, prefix) => {
+    const suffix = '<title>Malformed attrs</title></head>';
+    const chunkings = [[prefix, suffix], [...(prefix + suffix)]];
+    for (const [index, parts] of chunkings.entries()) {
+      const stream = headThenErrorStream(parts);
+      fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'text/html' } }));
+
+      expect(await preview(`${origin}/malformed-attrs-${index}`)).toMatchObject({ ok: true, data: { title: 'Malformed attrs' } });
+    }
+  });
+
+  it('ignores marker-like text inside XHTML CDATA sections', async () => {
+    const stream = headThenErrorStream([
+      '<head><script><![CDATA[</head><body>]]></script>',
+      '<title>Cdata test</title></head>',
+    ]);
+    fetchMock.mockResolvedValueOnce(new Response(stream, { headers: { 'content-type': 'application/xhtml+xml' } }));
+
+    expect(await preview(`${origin}/cdata-marker`)).toMatchObject({ ok: true, data: { title: 'Cdata test' } });
+  });
+
+  it('truncates at the byte cap and keeps metadata when the head never closes', async () => {
+    const head = '<title>Cap test</title><!--' + 'x'.repeat(500_000);
+    fetchMock.mockResolvedValueOnce(new Response(head, { headers: { 'content-type': 'text/html' } }));
+
+    expect(await preview(`${origin}/never-closes`)).toMatchObject({ ok: true, data: { title: 'Cap test' } });
   });
 
   it('times out a queued request that waits too long for a slot', async () => {

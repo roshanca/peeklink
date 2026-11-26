@@ -12,8 +12,11 @@ const MAX_CONCURRENT_REQUESTS = 4;
 const MAX_QUEUED_REQUESTS = 32;
 const REQUEST_TIMEOUT = 8_000;
 const QUEUE_WAIT_TIMEOUT = 15_000;
+const MAX_REDIRECTS = 5;
+const REDIRECT_OBSERVATION_GRACE = 30;
+const REDIRECT_OBSERVATION_TTL = 10_000;
 
-const transientFailures = new Set<PreviewErrorCode>(['network', 'timeout', 'queue-full', 'cancelled']);
+const transientFailures = new Set<PreviewErrorCode>(['network', 'timeout', 'queue-full', 'cancelled', 'permission']);
 
 class PreviewFailure extends Error {
   constructor(readonly code: PreviewErrorCode, message: string) {
@@ -100,11 +103,25 @@ interface PendingPreview {
   promise: Promise<PreviewResponse>;
   waiters: Set<string>;
   cancel: () => void;
+  targets: Set<string>;
+}
+
+interface CachedPreview {
+  response: PreviewResponse;
+  expires: number;
+  targets: string[];
+}
+
+interface RedirectObservation {
+  redirectUrl: string;
+  timeStamp: number;
 }
 
 const queue = new RequestQueue();
-const cache = new Map<string, { response: PreviewResponse; expires: number }>();
+const cache = new Map<string, CachedPreview>();
 const pending = new Map<string, PendingPreview>();
+const observedRedirects = new Map<string, RedirectObservation[]>();
+const fetchTurns = new Map<string, Promise<void>>();
 let anonymousWaiter = 0;
 const CONTENT_SCRIPT_ID = 'peeklink-preview';
 let registrationSync: Promise<void> = Promise.resolve();
@@ -177,19 +194,20 @@ function dropRevokedOrigins(patterns: string[]): void {
       return false;
     }
   };
-  for (const key of cache.keys()) {
-    if (revoked(key)) cache.delete(key);
+  for (const [key, entry] of cache) {
+    if (revoked(key) || entry.targets.some(revoked)) cache.delete(key);
   }
   // Revoked grants settle matching waiters for the rest of the request
   // lifetime — a later regrant cannot revive them.
   for (const [waiterKey, source] of waiterSources) {
     if (revoked(source.href)) settleWaiter(waiterKey, 'source');
   }
-  for (const [waiterKey, destination] of waiterDestinations) {
-    if (revoked(destination.href)) settleWaiter(waiterKey, 'destination');
+  for (const [waiterKey, destinations] of waiterDestinations) {
+    if ([...destinations].some(revoked)) settleWaiter(waiterKey, 'destination');
   }
   for (const [key, entry] of pending) {
-    if (revoked(key)) {
+    if (revoked(key) || [...entry.targets].some(revoked)) {
+      for (const waiterKey of entry.waiters) settleWaiter(waiterKey, 'destination');
       pending.delete(key);
       entry.cancel();
       continue;
@@ -255,31 +273,439 @@ function assertPublicUrl(rawUrl: string): URL {
   return url;
 }
 
-async function readBoundedBytes(response: Response, limit: number): Promise<Uint8Array> {
-  const declaredLength = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declaredLength) && declaredLength > limit) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new PreviewFailure('too-large', 'This page is too large to preview safely.');
+const enum ScanState {
+  Data,
+  TagOpen,
+  Bang,
+  BangDash,
+  CommentStart,
+  CommentStartDash,
+  Comment,
+  CommentDash,
+  CommentDashDash,
+  CommentEndBang,
+  BogusComment,
+  EndTagOpen,
+  StartTagName,
+  EndTagName,
+  TagBeforeAttrName,
+  TagAttrName,
+  TagAfterAttrName,
+  TagBeforeValue,
+  TagUnquoted,
+  TagAttrSQ,
+  TagAttrDQ,
+  TagAfterQuotedValue,
+  TagSelfClosing,
+  Rawtext,
+  RawtextLT,
+  CloseOpen,
+  CloseName,
+  CloseBoundary,
+  ScriptData,
+  ScriptLT,
+  ScriptBang,
+  ScriptBangDash,
+  ScriptEscaped,
+  ScriptEscapedDash,
+  ScriptEscapedDashDash,
+  ScriptEscapedLT,
+  ScriptDoubleEscStart,
+  ScriptDoubleEscStartBoundary,
+  ScriptDoubleEscaped,
+  ScriptDoubleEscapedDash,
+  ScriptDoubleEscapedDashDash,
+  ScriptDoubleEscapedLT,
+  CdataOpen,
+  Cdata,
+  CdataBracket,
+  CdataBracketBracket,
+}
+
+const RAWTEXT_TAGS = new Set(['script', 'style', 'title', 'textarea']);
+const LT = 0x3c; // <
+const GT = 0x3e; // >
+const SLASH = 0x2f;
+const DASH = 0x2d;
+const isWs = (b: number) => b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0c || b === 0x0d;
+const isNameBoundary = (b: number) => isWs(b) || b === SLASH || b === GT;
+
+// Byte-level HTML scanner that reports where metadata-bearing content ends:
+// a real </head> or <body> tag in data state. It skips comments, CDATA,
+// quoted attribute values, and style/title/textarea contents. Script contents
+// follow the HTML escaped and double-escaped states, so an inner "</script>"
+// that only ends a double escape does not close the element. XML documents
+// (XHTML) have no rawtext elements, so self-closing scripts need no special
+// handling there. Chunk boundaries are irrelevant because the state persists
+// across feeds. Bytes are matched as ASCII, which works in every
+// ASCII-compatible charset; UTF-16 pages simply never match and fall through
+// to the byte cap. When in doubt the scanner keeps reading — a missed end
+// only degrades to cap truncation, while a false end would lose metadata.
+class HeadEndScanner {
+  private state = ScanState.Data;
+  private name = '';
+  private pendingRawtext: string | null = null;
+  private rawtextName = '';
+  private matchPos = 0;
+  private closeReturn = ScanState.Rawtext;
+  private closeIsDoubleEscapeEnd = false;
+  private attrTagIsEnd = false;
+
+  constructor(private readonly xml: boolean) {}
+
+  feed(bytes: Uint8Array): boolean {
+    for (const byte of bytes) {
+      if (this.step(byte)) return true;
+    }
+    return false;
   }
+
+  private beginAttrs(isEnd: boolean, boundary: number): void {
+    this.attrTagIsEnd = isEnd;
+    this.state = boundary === SLASH ? ScanState.TagSelfClosing : ScanState.TagBeforeAttrName;
+  }
+
+  private openClose(returnTo: ScanState, doubleEscapeEnd: boolean): void {
+    this.closeReturn = returnTo;
+    this.closeIsDoubleEscapeEnd = doubleEscapeEnd;
+    this.state = ScanState.CloseOpen;
+  }
+
+  private step(b: number): boolean {
+    const lc = b | 0x20; // ASCII letters only: exact target bits, so no non-letter collides
+    const isLetter = lc >= 0x61 && lc <= 0x7a;
+    switch (this.state) {
+      case ScanState.Data:
+        if (b === LT) this.state = ScanState.TagOpen;
+        return false;
+      case ScanState.TagOpen:
+        if (b === SLASH) this.state = ScanState.EndTagOpen;
+        else if (b === 0x21) this.state = ScanState.Bang;
+        else if (b === 0x3f) this.state = ScanState.BogusComment;
+        else if (isLetter) {
+          this.state = ScanState.StartTagName;
+          this.name = String.fromCharCode(lc);
+        } else if (b !== LT) this.state = ScanState.Data;
+        return false;
+      case ScanState.Bang:
+        // Bogus comments (including doctypes, which end at the same ">") are
+        // skipped as a unit so marker-like text inside them stays inert.
+        if (b === DASH) this.state = ScanState.BangDash;
+        else if (this.xml && b === 0x5b) {
+          this.matchPos = 0;
+          this.state = ScanState.CdataOpen;
+        } else this.state = b === GT ? ScanState.Data : ScanState.BogusComment;
+        return false;
+      case ScanState.BogusComment:
+        if (b === GT) this.state = ScanState.Data;
+        return false;
+      case ScanState.BangDash:
+        if (b === DASH) this.state = ScanState.CommentStart;
+        else this.state = b === GT ? ScanState.Data : ScanState.BogusComment;
+        return false;
+      case ScanState.CommentStart:
+        // Abruptly closed comments: "<!-->" and "<!--->" end immediately.
+        if (b === GT) this.state = ScanState.Data;
+        else if (b === DASH) this.state = ScanState.CommentStartDash;
+        else this.state = ScanState.Comment;
+        return false;
+      case ScanState.CommentStartDash:
+        if (b === GT) this.state = ScanState.Data;
+        else if (b === DASH) this.state = ScanState.CommentDashDash;
+        else this.state = ScanState.Comment;
+        return false;
+      case ScanState.Comment:
+        if (b === DASH) this.state = ScanState.CommentDash;
+        return false;
+      case ScanState.CommentDash:
+        this.state = b === DASH ? ScanState.CommentDashDash : ScanState.Comment;
+        return false;
+      case ScanState.CommentDashDash:
+        if (b === GT) this.state = ScanState.Data;
+        else if (b === 0x21) this.state = ScanState.CommentEndBang;
+        else if (b !== DASH) this.state = ScanState.Comment;
+        return false;
+      case ScanState.CommentEndBang:
+        if (b === GT) this.state = ScanState.Data;
+        else if (b === DASH) this.state = ScanState.CommentDash;
+        else this.state = ScanState.Comment;
+        return false;
+      case ScanState.CdataOpen:
+        if (b === 'CDATA['.charCodeAt(this.matchPos)) {
+          this.matchPos += 1;
+          if (this.matchPos === 6) this.state = ScanState.Cdata;
+        } else this.state = ScanState.Data;
+        return false;
+      case ScanState.Cdata:
+        if (b === 0x5d) this.state = ScanState.CdataBracket;
+        return false;
+      case ScanState.CdataBracket:
+        this.state = b === 0x5d ? ScanState.CdataBracketBracket : ScanState.Cdata;
+        return false;
+      case ScanState.CdataBracketBracket:
+        if (b === GT) this.state = ScanState.Data;
+        else if (b !== 0x5d) this.state = ScanState.Cdata;
+        return false;
+      case ScanState.EndTagOpen:
+        if (isLetter) {
+          this.state = ScanState.EndTagName;
+          this.name = String.fromCharCode(lc);
+        } else this.state = b === GT ? ScanState.Data : ScanState.BogusComment;
+        return false;
+      case ScanState.StartTagName:
+        if (isNameBoundary(b)) {
+          if (this.name === 'body') return true;
+          this.pendingRawtext = !this.xml && RAWTEXT_TAGS.has(this.name) ? this.name : null;
+          if (b === GT) this.endStartTag();
+          else this.beginAttrs(false, b);
+        } else if (this.name.length < 16) {
+          this.name += String.fromCharCode(isLetter ? lc : b);
+        }
+        return false;
+      case ScanState.EndTagName:
+        if (isNameBoundary(b)) {
+          if (this.name === 'head') return true;
+          if (b === GT) this.state = ScanState.Data;
+          else this.beginAttrs(true, b);
+        } else if (this.name.length < 16) {
+          this.name += String.fromCharCode(isLetter ? lc : b);
+        }
+        return false;
+      case ScanState.TagBeforeAttrName:
+        if (isWs(b)) return false;
+        if (b === SLASH) this.state = ScanState.TagSelfClosing;
+        else if (b === GT) this.endTag();
+        else {
+          // At an attribute's start even "=" is part of the malformed name;
+          // it only separates a value once a name has already begun.
+          this.state = ScanState.TagAttrName;
+        }
+        return false;
+      case ScanState.TagAttrName:
+        if (b === 0x3d) this.state = ScanState.TagBeforeValue;
+        else if (isWs(b) || b === SLASH || b === GT) {
+          this.state = ScanState.TagAfterAttrName;
+          return this.step(b);
+        }
+        return false;
+      case ScanState.TagAfterAttrName:
+        if (isWs(b)) return false;
+        if (b === SLASH) this.state = ScanState.TagSelfClosing;
+        else if (b === 0x3d) this.state = ScanState.TagBeforeValue;
+        else if (b === GT) this.endTag();
+        else {
+          this.state = ScanState.TagAttrName;
+          return this.step(b);
+        }
+        return false;
+      case ScanState.TagBeforeValue:
+        if (b === 0x22) this.state = ScanState.TagAttrDQ;
+        else if (b === 0x27) this.state = ScanState.TagAttrSQ;
+        else if (b === GT) this.endTag();
+        else if (!isWs(b)) this.state = ScanState.TagUnquoted;
+        return false;
+      case ScanState.TagUnquoted:
+        if (b === GT) this.endTag();
+        else if (isWs(b)) this.state = ScanState.TagBeforeAttrName;
+        return false;
+      case ScanState.TagAttrSQ:
+        if (b === 0x27) this.state = ScanState.TagAfterQuotedValue;
+        return false;
+      case ScanState.TagAttrDQ:
+        if (b === 0x22) this.state = ScanState.TagAfterQuotedValue;
+        return false;
+      case ScanState.TagAfterQuotedValue:
+        if (isWs(b)) this.state = ScanState.TagBeforeAttrName;
+        else if (b === SLASH) this.state = ScanState.TagSelfClosing;
+        else if (b === GT) this.endTag();
+        else {
+          this.state = ScanState.TagBeforeAttrName;
+          return this.step(b);
+        }
+        return false;
+      case ScanState.TagSelfClosing:
+        if (b === GT) this.endTag();
+        else {
+          this.state = ScanState.TagBeforeAttrName;
+          return this.step(b);
+        }
+        return false;
+      case ScanState.Rawtext:
+        if (b === LT) this.state = ScanState.RawtextLT;
+        return false;
+      case ScanState.RawtextLT:
+        if (b === SLASH) this.openClose(ScanState.Rawtext, false);
+        else if (b !== LT) this.state = ScanState.Rawtext;
+        return false;
+      case ScanState.CloseOpen:
+        if (isLetter && lc === this.rawtextName.charCodeAt(0)) {
+          this.matchPos = 1;
+          this.state = ScanState.CloseName;
+          return false;
+        }
+        // A failed candidate is text: the current byte is reconsumed in the
+        // state the scanner returns to, so an overlapping "<" or dash is not lost.
+        this.state = this.closeReturn;
+        return this.step(b);
+      case ScanState.CloseName:
+        if (isLetter && lc === this.rawtextName.charCodeAt(this.matchPos)) {
+          this.matchPos += 1;
+          if (this.matchPos === this.rawtextName.length) this.state = ScanState.CloseBoundary;
+          return false;
+        }
+        this.state = this.closeReturn;
+        return this.step(b);
+      case ScanState.CloseBoundary:
+        if (this.closeIsDoubleEscapeEnd) {
+          // Inside a double-escaped script section "</script" is text, not a
+          // tag: it merely returns the script to the escaped state.
+          if (isNameBoundary(b)) this.state = ScanState.ScriptEscaped;
+          else {
+            this.state = this.closeReturn;
+            return this.step(b);
+          }
+        } else if (b === GT) this.state = ScanState.Data;
+        else if (isWs(b) || b === SLASH) this.beginAttrs(true, b);
+        else {
+          this.state = this.closeReturn;
+          return this.step(b);
+        }
+        return false;
+      case ScanState.ScriptData:
+        if (b === LT) this.state = ScanState.ScriptLT;
+        return false;
+      case ScanState.ScriptLT:
+        if (b === SLASH) this.openClose(ScanState.ScriptData, false);
+        else if (b === 0x21) this.state = ScanState.ScriptBang;
+        else if (b !== LT) this.state = ScanState.ScriptData;
+        return false;
+      case ScanState.ScriptBang:
+        if (b === DASH) {
+          this.state = ScanState.ScriptBangDash;
+          return false;
+        }
+        this.state = ScanState.ScriptData;
+        return this.step(b);
+      case ScanState.ScriptBangDash:
+        if (b === DASH) {
+          this.state = ScanState.ScriptEscapedDashDash;
+          return false;
+        }
+        this.state = ScanState.ScriptData;
+        return this.step(b);
+      case ScanState.ScriptEscaped:
+        if (b === DASH) this.state = ScanState.ScriptEscapedDash;
+        else if (b === LT) this.state = ScanState.ScriptEscapedLT;
+        return false;
+      case ScanState.ScriptEscapedDash:
+        if (b === DASH) this.state = ScanState.ScriptEscapedDashDash;
+        else if (b === LT) this.state = ScanState.ScriptEscapedLT;
+        else this.state = ScanState.ScriptEscaped;
+        return false;
+      case ScanState.ScriptEscapedDashDash:
+        if (b === GT) this.state = ScanState.ScriptData;
+        else if (b === LT) this.state = ScanState.ScriptEscapedLT;
+        else if (b !== DASH) this.state = ScanState.ScriptEscaped;
+        return false;
+      case ScanState.ScriptEscapedLT:
+        if (b === SLASH) this.openClose(ScanState.ScriptEscaped, false);
+        else if (isLetter && lc === 0x73) {
+          this.matchPos = 1;
+          this.state = ScanState.ScriptDoubleEscStart;
+        } else if (b !== LT) {
+          // Anything else is script text: the byte is reconsumed so a dash
+          // still counts toward a closing "-->".
+          this.state = ScanState.ScriptEscaped;
+          return this.step(b);
+        }
+        return false;
+      case ScanState.ScriptDoubleEscStart:
+        if (isLetter && lc === this.rawtextName.charCodeAt(this.matchPos)) {
+          this.matchPos += 1;
+          if (this.matchPos === this.rawtextName.length) this.state = ScanState.ScriptDoubleEscStartBoundary;
+          return false;
+        }
+        this.state = ScanState.ScriptEscaped;
+        return this.step(b);
+      case ScanState.ScriptDoubleEscStartBoundary:
+        if (isNameBoundary(b)) {
+          this.state = ScanState.ScriptDoubleEscaped;
+          return false;
+        }
+        this.state = ScanState.ScriptEscaped;
+        return this.step(b);
+      case ScanState.ScriptDoubleEscaped:
+        if (b === DASH) this.state = ScanState.ScriptDoubleEscapedDash;
+        else if (b === LT) this.state = ScanState.ScriptDoubleEscapedLT;
+        return false;
+      case ScanState.ScriptDoubleEscapedDash:
+        if (b === DASH) this.state = ScanState.ScriptDoubleEscapedDashDash;
+        else if (b === LT) this.state = ScanState.ScriptDoubleEscapedLT;
+        else this.state = ScanState.ScriptDoubleEscaped;
+        return false;
+      case ScanState.ScriptDoubleEscapedDashDash:
+        if (b === GT) this.state = ScanState.ScriptData;
+        else if (b === LT) this.state = ScanState.ScriptDoubleEscapedLT;
+        else if (b !== DASH) this.state = ScanState.ScriptDoubleEscaped;
+        return false;
+      case ScanState.ScriptDoubleEscapedLT:
+        if (b === SLASH) this.openClose(ScanState.ScriptDoubleEscaped, true);
+        else if (b !== LT) {
+          this.state = ScanState.ScriptDoubleEscaped;
+          return this.step(b);
+        }
+        return false;
+    }
+  }
+
+  private endTag(): void {
+    if (this.attrTagIsEnd) this.state = ScanState.Data;
+    else this.endStartTag();
+  }
+
+  private endStartTag(): void {
+    if (this.pendingRawtext === 'script') {
+      this.rawtextName = 'script';
+      this.state = ScanState.ScriptData;
+    } else if (this.pendingRawtext) {
+      this.rawtextName = this.pendingRawtext;
+      this.state = ScanState.Rawtext;
+    } else {
+      this.state = ScanState.Data;
+    }
+    this.pendingRawtext = null;
+  }
+}
+
+// Metadata lives in <head>, so reading stops as soon as its end is seen;
+// otherwise the page is silently truncated at the cap. Either way the regex
+// metadata parser works fine on the partial document, so heavy pages degrade
+// to whatever metadata their head carried instead of failing outright.
+async function readBoundedBytes(response: Response, limit: number): Promise<Uint8Array> {
   if (!response.body) throw new PreviewFailure('network', 'The website returned an empty response.');
 
   const reader = response.body.getReader();
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  const scanner = new HeadEndScanner(contentType.includes('application/xhtml+xml'));
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let headEndSeen = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
-      total += value.byteLength;
-      if (total > limit) {
+      const chunk = total + value.byteLength > limit ? value.subarray(0, limit - total) : value;
+      if (scanner.feed(chunk)) headEndSeen = true;
+      chunks.push(chunk);
+      total += chunk.byteLength;
+      if (headEndSeen || total >= limit) {
         await reader.cancel().catch(() => undefined);
-        throw new PreviewFailure('too-large', 'This page is too large to preview safely.');
+        break;
       }
-      chunks.push(value);
     }
   } catch (error) {
-    if (!(error instanceof PreviewFailure)) await reader.cancel().catch(() => undefined);
+    await reader.cancel().catch(() => undefined);
     throw error;
   }
 
@@ -575,13 +1001,105 @@ function decodeHtml(bytes: Uint8Array, contentType: string): string {
   }
 }
 
-function fetchHtml(url: URL): { promise: Promise<{ html: string; finalUrl: string; frame: FramePolicy }>; cancel: () => void } {
+function pruneObservedRedirects(now = Date.now()): void {
+  for (const [url, observations] of observedRedirects) {
+    const fresh = observations.filter(observation => now - observation.timeStamp <= REDIRECT_OBSERVATION_TTL);
+    if (fresh.length > 0) observedRedirects.set(url, fresh);
+    else observedRedirects.delete(url);
+  }
+}
+
+function consumeObservedRedirect(url: URL, startedAt: number): string | undefined {
+  pruneObservedRedirects();
+  const observations = observedRedirects.get(url.href);
+  if (!observations) return undefined;
+  const index = observations.findIndex(observation => observation.timeStamp >= startedAt - 1);
+  if (index === -1) return undefined;
+  const [observation] = observations.splice(index, 1);
+  if (observations.length === 0) observedRedirects.delete(url.href);
+  return observation?.redirectUrl;
+}
+
+async function observedRedirectUrl(url: URL, startedAt: number): Promise<string | undefined> {
+  const immediate = consumeObservedRedirect(url, startedAt);
+  if (immediate) return immediate;
+  await new Promise(resolve => { setTimeout(resolve, REDIRECT_OBSERVATION_GRACE); });
+  return consumeObservedRedirect(url, startedAt);
+}
+
+// Serializes fetches per URL so a redirect observation cannot be consumed by
+// the wrong concurrent request. The turn is held until the observation is
+// consumed; stale observations are cleared when the turn is acquired. Waiting
+// is abort-aware: an aborted waiter gives up its place without entering the
+// critical section, while the chain still ties successors to the holder that
+// is actually running, so cancelling never overtakes it.
+async function withFetchTurn<T>(url: URL, signal: AbortSignal, task: () => Promise<T>): Promise<T> {
+  const previous = fetchTurns.get(url.href) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  const tail = previous.then(() => current);
+  fetchTurns.set(url.href, tail);
+  // The map entry is only dropped once this position in the chain has fully
+  // settled — never while an earlier holder may still be running.
+  void tail.then(() => {
+    if (fetchTurns.get(url.href) === tail) fetchTurns.delete(url.href);
+  });
+
+  const aborted = new Promise<never>((_, reject) => {
+    if (signal.aborted) reject(new DOMException('Aborted', 'AbortError'));
+    else signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+  });
+  try {
+    await Promise.race([previous, aborted]);
+  } catch (error) {
+    release();
+    throw error;
+  }
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+function observeRedirectHeaders(details: chrome.webRequest.WebResponseHeadersDetails): void {
+  const extensionOrigin = chrome.runtime.getURL('').replace(/\/$/, '');
+  if (details.tabId !== -1 || details.type !== 'xmlhttprequest' || details.method !== 'GET' || details.initiator !== extensionOrigin) return;
+  if (![301, 302, 303, 307, 308].includes(details.statusCode)) return;
+  const redirectUrl = details.responseHeaders?.find(header => header.name.toLowerCase() === 'location')?.value;
+  if (!redirectUrl) return;
+  pruneObservedRedirects();
+  const observations = observedRedirects.get(details.url) ?? [];
+  observations.push({ redirectUrl, timeStamp: details.timeStamp });
+  while (observations.length > 8) observations.shift();
+  observedRedirects.set(details.url, observations);
+}
+
+let redirectObserverUses = 0;
+
+function retainRedirectObserver(): void {
+  if (redirectObserverUses++ === 0) {
+    chrome.webRequest?.onHeadersReceived.addListener(
+      observeRedirectHeaders,
+      { urls: ['http://*/*', 'https://*/*'], types: ['xmlhttprequest'], tabId: -1 },
+      ['responseHeaders'],
+    );
+  }
+}
+
+function releaseRedirectObserver(): void {
+  redirectObserverUses = Math.max(0, redirectObserverUses - 1);
+  if (redirectObserverUses === 0) chrome.webRequest?.onHeadersReceived.removeListener(observeRedirectHeaders);
+}
+
+function fetchHtml(url: URL, targets: Set<string>): { promise: Promise<{ html: string; finalUrl: string; frame: FramePolicy }>; cancel: () => void } {
   return queue.run(async signal => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
     const propagate = () => controller.abort();
     if (signal.aborted) controller.abort();
     else signal.addEventListener('abort', propagate, { once: true });
+    retainRedirectObserver();
     try {
       const request = (target: URL) => fetch(target.href, {
         signal: controller.signal,
@@ -592,29 +1110,71 @@ function fetchHtml(url: URL): { promise: Promise<{ html: string; finalUrl: strin
         headers: { Accept: 'text/html,application/xhtml+xml' },
       });
       let target = url;
-      let response = await request(target);
-      if (response.type === 'opaqueredirect' && url.pathname !== '/') {
+      let redirectCount = 0;
+      let slashProbeUsed = false;
+      const seen = new Set([url.href]);
+
+      while (true) {
+        targets.add(target.href);
+        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        const { response, redirectUrl } = await withFetchTurn(target, controller.signal, async () => {
+          const startedAt = Date.now();
+          // Only this request can be in flight for this URL now, so anything
+          // already observed is stale and must not be consumed here.
+          observedRedirects.delete(target.href);
+          const response = await request(target);
+          if (response.type !== 'opaqueredirect') return { response, redirectUrl: undefined };
+          await response.body?.cancel().catch(() => undefined);
+          return { response, redirectUrl: await observedRedirectUrl(target, startedAt) };
+        });
+        if (response.type !== 'opaqueredirect') {
+          if (!response.ok) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new PreviewFailure('http', `The website returned HTTP ${response.status}.`);
+          }
+          const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+          if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new PreviewFailure('not-html', 'This link does not point to an HTML page.');
+          }
+          const finalUrl = assertPublicUrl(response.url || target.href);
+          const bytes = await readBoundedBytes(response, MAX_HTML_BYTES);
+          return { html: decodeHtml(bytes, contentType), finalUrl: finalUrl.href, frame: getFramePolicy(response.headers) };
+        }
+
+        if (redirectUrl) {
+          redirectCount += 1;
+          if (redirectCount > MAX_REDIRECTS) {
+            throw new PreviewFailure('redirect', 'This link redirects too many times. Open it in a new tab.');
+          }
+          let resolved: string;
+          try {
+            resolved = new URL(redirectUrl, target.href).href;
+          } catch {
+            throw new PreviewFailure('redirect', 'This link redirects to an invalid address. Open it in a new tab.');
+          }
+          const next = assertPublicUrl(resolved);
+          if (seen.has(next.href)) {
+            throw new PreviewFailure('redirect', 'This link redirects in a loop. Open it in a new tab.');
+          }
+          seen.add(next.href);
+          targets.add(next.href);
+          if (!await hasOriginPermission(next)) {
+            throw new PreviewFailure('permission', `This link redirects to ${next.hostname}, which is not allowed in PeekLink settings.`);
+          }
+          target = next;
+          continue;
+        }
+
         // Fetch hides the Location header. Probe only the same path's slash variant.
-        target = new URL(url.href);
-        target.pathname = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : `${url.pathname}/`;
-        response = await request(target);
-      }
-      if (response.type === 'opaqueredirect' || (target !== url && !response.ok)) {
-        await response.body?.cancel().catch(() => undefined);
+        if (!slashProbeUsed && target.href === url.href && url.pathname !== '/') {
+          slashProbeUsed = true;
+          target = new URL(url.href);
+          target.pathname = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : `${url.pathname}/`;
+          continue;
+        }
         throw new PreviewFailure('redirect', 'This link redirects to another address. Open it in a new tab.');
       }
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => undefined);
-        throw new PreviewFailure('http', `The website returned HTTP ${response.status}.`);
-      }
-      const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
-      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
-        await response.body?.cancel().catch(() => undefined);
-        throw new PreviewFailure('not-html', 'This link does not point to an HTML page.');
-      }
-      const finalUrl = assertPublicUrl(response.url || target.href);
-      const bytes = await readBoundedBytes(response, MAX_HTML_BYTES);
-      return { html: decodeHtml(bytes, contentType), finalUrl: finalUrl.href, frame: getFramePolicy(response.headers) };
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw signal.aborted
@@ -623,6 +1183,7 @@ function fetchHtml(url: URL): { promise: Promise<{ html: string; finalUrl: strin
       }
       throw error;
     } finally {
+      releaseRedirectObserver();
       clearTimeout(timeout);
       signal.removeEventListener('abort', propagate);
     }
@@ -638,7 +1199,7 @@ function failureResponse(error: unknown): PreviewResponse {
   };
 }
 
-function readCache(key: string): PreviewResponse | undefined {
+function readCacheEntry(key: string): CachedPreview | undefined {
   const hit = cache.get(key);
   if (!hit) return undefined;
   if (hit.expires <= Date.now()) {
@@ -647,12 +1208,12 @@ function readCache(key: string): PreviewResponse | undefined {
   }
   cache.delete(key);
   cache.set(key, hit);
-  return hit.response;
+  return hit;
 }
 
-function writeCache(key: string, response: PreviewResponse): void {
+function writeCache(key: string, response: PreviewResponse, targets = [key]): void {
   cache.delete(key);
-  cache.set(key, { response, expires: Date.now() + (response.ok ? SUCCESS_TTL : FAILURE_TTL) });
+  cache.set(key, { response, expires: Date.now() + (response.ok ? SUCCESS_TTL : FAILURE_TTL), targets });
   const now = Date.now();
   for (const [entryKey, entry] of cache) {
     if (entry.expires <= now) cache.delete(entryKey);
@@ -680,7 +1241,9 @@ const CANCELLED: PreviewResponse = {
 // settled until its request ends, so a later regrant cannot revive it. The
 // first terminal event wins — a revocation cannot mask an explicit cancel.
 const waiterSources = new Map<string, URL>();
-const waiterDestinations = new Map<string, URL>();
+// Every URL whose revocation must settle the waiter: starts with the original
+// destination and grows to the full redirect chain once it is known.
+const waiterDestinations = new Map<string, Set<string>>();
 const settledWaiters = new Map<string, 'cancelled' | 'source' | 'destination'>();
 const liveWaiterKeys = new Set<string>();
 // Resolves a waiter's settledSignal so it stops blocking on the shared
@@ -724,28 +1287,33 @@ function startLoad(url: URL): PendingPreview {
     waiters: new Set(),
     cancel: () => abortFetch?.(),
     promise: Promise.resolve(PERMISSION_DENIED),
+    targets: new Set([url.href]),
   };
   pending.set(url.href, entry);
   entry.promise = (async () => {
     try {
-      const cached = readCache(url.href);
-      if (cached) return cached;
+      const cached = readCacheEntry(url.href);
+      if (cached) {
+        for (const target of cached.targets) entry.targets.add(target);
+        return cached.response;
+      }
       try {
-        const request = fetchHtml(url);
+        const request = fetchHtml(url, entry.targets);
         abortFetch = request.cancel;
         const { html, finalUrl, frame } = await request.promise;
         abortFetch = undefined;
         // The destination grant may have been revoked while fetching.
-        if (!await hasOriginPermission(url)) return PERMISSION_DENIED;
+        const [originOk, finalOk] = await Promise.all([hasOriginPermission(url), hasOriginPermission(new URL(finalUrl))]);
+        if (!originOk || !finalOk) return PERMISSION_DENIED;
         const response: PreviewResponse = { ok: true, data: parseMetadata(html, finalUrl), frame };
         // A detached entry (cancelled or evicted) may not write to the cache.
-        if (pending.get(url.href) === entry) writeCache(url.href, response);
+        if (pending.get(url.href) === entry) writeCache(url.href, response, [...entry.targets]);
         return response;
       } catch (error) {
         const response = failureResponse(error);
         if (!response.ok && !transientFailures.has(response.code) && await hasOriginPermission(url)
           && pending.get(url.href) === entry) {
-          writeCache(url.href, response);
+          writeCache(url.href, response, [...entry.targets]);
         }
         return response;
       }
@@ -774,12 +1342,19 @@ function getPreview(url: URL, waiterKey: string, source: URL): Promise<PreviewRe
       const response = await Promise.race([entry.promise, settledSignal]);
       const settled = settledResponse(waiterKey);
       if (settled) return settled;
+      // Register the full redirect chain before the first await after the
+      // response. Permission events arrive as macrotasks, so no revocation can
+      // interleave before this registration, and any later one settles us.
+      const destinations = waiterDestinations.get(waiterKey);
+      if (destinations) for (const target of entry.targets) destinations.add(target);
       // Both grants are re-verified immediately before delivery.
-      const [sourceOk, destinationOk] = await Promise.all([hasOriginPermission(source), hasOriginPermission(url)]);
+      const finalUrl = response.ok && response.data.url !== url.href ? new URL(response.data.url) : null;
+      const finalPermission = finalUrl ? hasOriginPermission(finalUrl) : Promise.resolve(true);
+      const [sourceOk, destinationOk, finalOk] = await Promise.all([hasOriginPermission(source), hasOriginPermission(url), finalPermission]);
       const late = settledResponse(waiterKey);
       if (late) return late;
       if (!sourceOk) return SOURCE_DENIED;
-      if (!destinationOk) return PERMISSION_DENIED;
+      if (!destinationOk || !finalOk) return PERMISSION_DENIED;
       return response;
     } finally {
       waiterNotifiers.delete(waiterKey);
@@ -822,7 +1397,7 @@ async function handlePreviewRequest(url: string, sourceUrl: string | undefined, 
     } catch (error) {
       destinationError = failureResponse(error);
     }
-    if (destination) waiterDestinations.set(waiterKey, destination);
+    if (destination) waiterDestinations.set(waiterKey, new Set([destination.href]));
     const early = settledResponse(waiterKey);
     if (early) return early;
     if (!await hasOriginPermission(source)) return settledResponse(waiterKey) ?? SOURCE_DENIED;
